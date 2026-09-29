@@ -1,0 +1,16 @@
+#!/bin/sh
+# SPDX-License-Identifier: ISC
+# Модули (wil6210, netconsole) грузятся штатно через /etc/modules.d.
+#
+# Здесь только инструментовка драйвера (патчи 905-907): трассировка прошивки.
+i=0
+while [ $i -lt 60 ] && [ ! -d /sys/module/wil6210 ]; do i=$((i+1)); sleep 1; done
+sleep 3
+# сторож тихого перезапуска прошивки (907): признак — обнулённые байты уровней
+echo 1000 > /sys/module/wil6210/parameters/fw_watchdog_ms 2>/dev/null
+echo 100 > /sys/module/wil6210/parameters/uc_trace_ms 2>/dev/null
+echo 7 > /sys/module/wil6210/parameters/fw_log_level 2>/dev/null
+for d in /sys/kernel/debug/ieee80211/phy*/wil6210; do
+    [ -w "$d/fw_log_level" ] && echo 7 > "$d/fw_log_level"
+done
+exit 0

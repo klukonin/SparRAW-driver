@@ -1,0 +1,61 @@
+wil6210: drop the TX rings on reset so the queues can be woken again
+
+txrx_ops.tx_fini() is a no-op on the legacy DMA path, so the TX rings survive
+a device reset while the firmware side of them does not - which matters when
+the firmware restarted on its own and its RAM was re-initialised. The
+descriptors still in flight are then never completed, the ring keeps looking
+full forever, and __wil_update_net_queues() refuses to wake the net queues
+while any ring of the vif is full ("ring %d full, can't wake").
+
+The symptom is a link that associates again after recovery and stays at
+Tx queue[0] state: 0x1 DRV_XOFF with a frozen packet counter: on a wAP 60G
+the ring was left with 3612 of 4096 descriptors in flight and 483 free,
+below the wake threshold, so nothing ever moved again.
+
+Release the rings explicitly in wil_reset(), next to wil_bcast_fini_all().
+They are recreated on the next connect.
+--- a/drivers/net/wireless/ath/wil6210/main.c
++++ b/drivers/net/wireless/ath/wil6210/main.c
+@@ -207,6 +207,19 @@ void wil_mem_access_unlock(struct wil621
+ 	up_read(&wil->mem_lock);
+ }
+ 
++/*
++ * Drop every TX ring.
++ *
++ * txrx_ops.tx_fini() is a no-op on the legacy DMA path, so without this the
++ * rings survive a device reset while the FW side of them does not. The
++ * descriptors still in flight are then never completed: the ring keeps
++ * looking full forever, and __wil_update_net_queues() refuses to wake the
++ * net queues while any ring of the vif is full ("ring %d full, can't wake").
++ * The result is a link that associates again after recovery but never
++ * transmits a single frame.
++ */
++static void wil_ring_fini_tx_all(struct wil6210_priv *wil);
++
+ static void wil_ring_fini_tx(struct wil6210_priv *wil, int id)
+ {
+ 	struct wil_ring *ring = &wil->ring_tx[id];
+@@ -238,6 +251,14 @@ static void wil_ring_fini_tx(struct wil6
+ 	wil->txrx_ops.ring_fini_tx(wil, ring);
+ }
+ 
++static void wil_ring_fini_tx_all(struct wil6210_priv *wil)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(wil->ring_tx); i++)
++		wil_ring_fini_tx(wil, i);
++}
++
+ static bool wil_vif_is_connected(struct wil6210_priv *wil, u8 mid)
+ {
+ 	int i;
+@@ -1838,6 +1859,7 @@ int wil_reset(struct wil6210_priv *wil,
+ 			vif->ptk_rekey_state = WIL_REKEY_IDLE;
+ 		}
+ 	}
++	wil_ring_fini_tx_all(wil);
+ 	wil_bcast_fini_all(wil);
+ 
+ 	/* Disable device led before reset*/

@@ -1,0 +1,119 @@
+wil6210: pass the IBSS cell BSSID to the firmware
+
+A DMG IBSS runs under one BSSID (IEEE 802.11-2020 11.1.4.4): the creator
+picks a random locally administered address, a joiner takes the cell's.
+WMI_PCP_START has no BSSID field, so send it first with the SparRAW 6.4
+mesh command WMI_IBSS_BSSID (0x85a), and report the join under it.  The
+BSSID comes from userspace (iw ... ibss join ... BSSID); without one the
+creator makes it up and a joiner fails with -EINVAL.  Other firmware
+ignores the unknown command.
+--- a/drivers/net/wireless/ath/wil6210/cfg80211.c
++++ b/drivers/net/wireless/ath/wil6210/cfg80211.c
+@@ -2696,10 +2696,22 @@ static int wil_cfg80211_join_ibss(struct
+ 	struct wil6210_vif *vif = ndev_to_vif(ndev);
+ 	struct ieee80211_channel *chan_def = params->chandef.chan;
+ 	u8 chan = 1;
++	u8 bssid[ETH_ALEN];
+ 	int rc;
+ 
+ 	if (vif->mid != 0)
+ 		return -EOPNOTSUPP;
++
++	/* BSSID of the cell (IEEE 802.11-2020 11.1.4.4): given by userspace
++	 * ("iw ... ibss join SSID FREQ ... BSSID"), otherwise the creator picks a
++	 * random locally administered one.  A joiner has to name the cell.
++	 */
++	if (params->bssid)
++		ether_addr_copy(bssid, params->bssid);
++	else if (ibss_creator)
++		eth_random_addr(bssid);
++	else
++		return -EINVAL;
+ 	if (params->ssid_len > sizeof(vif->ssid))
+ 		return -EINVAL;
+ 	if (chan_def)
+@@ -2726,6 +2738,11 @@ static int wil_cfg80211_join_ibss(struct
+ 			return rc;
+ 	}
+ 
++	/* firmware without the command (not SparRAW 6.4 mesh) ignores it */
++	rc = wmi_set_ibss_bssid(vif, bssid);
++	if (rc)
++		return rc;
++
+ 	netif_carrier_on(ndev);
+ 	rc = wmi_pcp_start(vif, vif->bi,
+ 			   ibss_creator ? WMI_NETTYPE_ADHOC_CREATOR
+@@ -2752,16 +2769,16 @@ static int wil_cfg80211_join_ibss(struct
+ 
+ 		bss = cfg80211_inform_bss(wiphy, chan_def,
+ 					  CFG80211_BSS_FTYPE_PRESP,
+-					  ndev->dev_addr, 0,
++					  bssid, 0,
+ 					  WLAN_CAPABILITY_IBSS,
+ 					  vif->bi, ie, ie_len, 0, GFP_KERNEL);
+ 		if (bss)
+ 			cfg80211_put_bss(wiphy, bss);
+ 	}
+ 
+-	cfg80211_ibss_joined(ndev, ndev->dev_addr, chan_def, GFP_KERNEL);
+-	wil_info(wil, "IBSS %s on channel %d (chan_def %s)\n",
+-		 ibss_creator ? "created" : "joined",
++	cfg80211_ibss_joined(ndev, bssid, chan_def, GFP_KERNEL);
++	wil_info(wil, "IBSS %s %pM on channel %d (chan_def %s)\n",
++		 ibss_creator ? "created" : "joined", bssid,
+ 		 chan, chan_def ? "ok" : "missing");
+ 	return 0;
+ }
+--- a/drivers/net/wireless/ath/wil6210/wil6210.h
++++ b/drivers/net/wireless/ath/wil6210/wil6210.h
+@@ -1365,6 +1365,7 @@ void wil_cfg80211_deinit(struct wil6210_
+ void wil_p2p_wdev_free(struct wil6210_priv *wil);
+ 
+ int wmi_set_mac_address(struct wil6210_priv *wil, const void *addr);
++int wmi_set_ibss_bssid(struct wil6210_vif *vif, const u8 *bssid);
+ int wmi_pcp_start(struct wil6210_vif *vif, int bi, u8 wmi_nettype, u8 chan,
+ 		  u8 edmg_chan, u8 hidden_ssid, u8 is_go);
+ int wmi_pcp_stop(struct wil6210_vif *vif);
+--- a/drivers/net/wireless/ath/wil6210/wmi.c
++++ b/drivers/net/wireless/ath/wil6210/wmi.c
+@@ -2328,6 +2328,15 @@ module_param(roleless_link, bool, 0444);
+ MODULE_PARM_DESC(roleless_link,
+ 		 " link with peers found by A-BFT without roles (SparRAW FW 6.4, needs oob_mode=1)");
+ 
++int wmi_set_ibss_bssid(struct wil6210_vif *vif, const u8 *bssid)
++{
++	struct wil6210_priv *wil = vif_to_wil(vif);
++	struct wmi_ibss_bssid_cmd cmd = {};
++
++	ether_addr_copy(cmd.bssid, bssid);
++	return wmi_send(wil, WMI_IBSS_BSSID_CMDID, vif->mid, &cmd, sizeof(cmd));
++}
++
+ int wmi_pcp_start(struct wil6210_vif *vif, int bi, u8 wmi_nettype,
+ 		  u8 chan, u8 wmi_edmg_chan, u8 hidden_ssid, u8 is_go)
+ {
+--- a/drivers/net/wireless/ath/wil6210/wmi.h
++++ b/drivers/net/wireless/ath/wil6210/wmi.h
+@@ -201,6 +201,8 @@ enum wmi_command_id {
+ 	WMI_RF_XPM_READ_CMDID				= 0x856,
+ 	WMI_RF_XPM_WRITE_CMDID				= 0x857,
+ 	WMI_LED_CFG_CMDID				= 0x858,
++	/* SparRAW FW 6.4 mesh: BSSID of the DMG IBSS cell, sent before PCP_START */
++	WMI_IBSS_BSSID_CMDID				= 0x85a,
+ 	WMI_SET_CONNECT_SNR_THR_CMDID			= 0x85B,
+ 	WMI_SET_ACTIVE_SILENT_RSSI_TABLE_CMDID		= 0x85C,
+ 	WMI_RF_PWR_ON_DELAY_CMDID			= 0x85D,
+@@ -813,6 +815,12 @@ struct wmi_power_mgmt_cfg_cmd {
+ 	u8 reserved[3];
+ } __packed;
+ 
++/* WMI_IBSS_BSSID_CMDID (SparRAW FW 6.4 mesh), no reply */
++struct wmi_ibss_bssid_cmd {
++	u8 bssid[WMI_MAC_LEN];
++	u8 reserved[2];
++} __packed;
++
+ /* WMI_PCP_START_CMDID */
+ enum wmi_ap_sme_offload_mode {
+ 	/* Full AP SME in FW */

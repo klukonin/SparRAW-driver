@@ -1,0 +1,122 @@
+wil6210: arm the firmware trace without resetting the device
+
+The firmware can restart on its own without telling the host - seen under
+sustained TX load, where the log ring header comes back zeroed while the
+driver still believes the link is up, the TX ring stays stopped and WMI
+commands time out. Logging is off again after such a restart, and re-arming
+it through a device reset is exactly the operation that wedges the board in
+that state (only a power cycle recovers it).
+
+So take the level from a debugfs file as well and write it straight into the
+ring header, no reset involved:
+
+	echo 7 > /sys/kernel/debug/ieee80211/phy0/wil6210/fw_log_level
+
+The fw_log_level module parameter keeps working for the reset path.
+--- a/drivers/net/wireless/ath/wil6210/debugfs.c
++++ b/drivers/net/wireless/ath/wil6210/debugfs.c
+@@ -1539,6 +1539,33 @@ static ssize_t wil_write_file_recovery(s
+ 	return rc;
+ }
+ 
++/*---------FW log level------------*/
++/* Write the per-module level bytes into the FW log ring header right now,
++ * without resetting the device. Needed because the FW can restart on its own
++ * and come back with logging off, and a reset in that state hangs the board.
++ */
++static ssize_t wil_write_file_fw_log_level(struct file *file,
++					   const char __user *buf,
++					   size_t count, loff_t *ppos)
++{
++	struct wil6210_priv *wil = file->private_data;
++	u8 level;
++	int rc;
++
++	rc = kstrtou8_from_user(buf, count, 0, &level);
++	if (rc)
++		return rc;
++
++	wil_fw_log_enable(wil, level);
++
++	return count;
++}
++
++static const struct file_operations fops_fw_log_level = {
++	.write = wil_write_file_fw_log_level,
++	.open  = simple_open,
++};
++
+ static const struct file_operations fops_recovery = {
+ 	.read = wil_read_file_recovery,
+ 	.write = wil_write_file_recovery,
+@@ -2340,6 +2367,7 @@ static const struct {
+ 	{"link",	0444,		&link_fops},
+ 	{"info",	0444,		&info_fops},
+ 	{"recovery", 0644,		&fops_recovery},
++	{"fw_log_level", 0200,		&fops_fw_log_level},
+ 	{"led_cfg",	0644,		&fops_led_cfg},
+ 	{"led_blink_time",	0644,	&fops_led_blink_time},
+ 	{"fw_capabilities",	0444,	&fw_capabilities_fops},
+--- a/drivers/net/wireless/ath/wil6210/main.c
++++ b/drivers/net/wireless/ath/wil6210/main.c
+@@ -1621,15 +1621,21 @@ void wil_clear_fw_log_addr(struct wil621
+  * Vendor images come up with those bytes zeroed, so the ring is allocated and
+  * never written to - which is exactly the wrong state when the FW wedges with
+  * no assert code to go on.
++ *
++ * The firmware can also restart itself without telling the host (seen under
++ * sustained TX load: the ring header comes back zeroed while the driver still
++ * believes the link is up). Re-arming then needs a device reset, which is
++ * exactly the operation that wedges the board in that state - so the same
++ * function is exposed through debugfs to be called without any reset.
+  */
+-void wil_fw_log_enable(struct wil6210_priv *wil)
++void wil_fw_log_enable(struct wil6210_priv *wil, u8 level)
+ {
+ 	u32 addr = wil_r(wil, RGF_USER_USAGE_1);
+ 	void __iomem *dst = NULL;
+ 	u32 word;
+ 	int i;
+ 
+-	if (!fw_log_level)
++	if (!level)
+ 		return;
+ 
+ 	if (!addr) {
+@@ -1654,14 +1660,14 @@ void wil_fw_log_enable(struct wil6210_pr
+ 	}
+ 
+ 	/* one level byte per module, all set the same */
+-	word = fw_log_level * 0x01010101u;
++	word = level * 0x01010101u;
+ 	for (i = 0; i < 16; i += 4)
+ 		writel(word, (u8 __iomem *)dst + sizeof(u32) + i);
+ 	/* the levels must land before the FW next looks at them */
+ 	wmb();
+ 
+ 	wil_info(wil, "FW log enabled at 0x%08x, level mask 0x%02x\n",
+-		 addr, fw_log_level);
++		 addr, level);
+ }
+ 
+ /*
+@@ -1849,7 +1855,7 @@ int wil_reset(struct wil6210_priv *wil,
+ 			return rc;
+ 		}
+ 
+-		wil_fw_log_enable(wil);
++		wil_fw_log_enable(wil, fw_log_level);
+ 
+ 		wil->txrx_ops.configure_interrupt_moderation(wil);
+ 
+--- a/drivers/net/wireless/ath/wil6210/wil6210.h
++++ b/drivers/net/wireless/ath/wil6210/wil6210.h
+@@ -1443,7 +1443,7 @@ int wmi_addba_rx_resp_edma(struct wil621
+ void update_supported_bands(struct wil6210_priv *wil);
+ 
+ void wil_clear_fw_log_addr(struct wil6210_priv *wil);
+-void wil_fw_log_enable(struct wil6210_priv *wil);
++void wil_fw_log_enable(struct wil6210_priv *wil, u8 level);
+ int wmi_set_cqm_rssi_config(struct wil6210_priv *wil,
+ 			    s32 rssi_thold, u32 rssi_hyst);
+ #endif /* __WIL6210_H__ */

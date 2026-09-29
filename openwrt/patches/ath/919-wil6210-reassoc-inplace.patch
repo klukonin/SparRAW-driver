@@ -1,0 +1,184 @@
+wil6210: reassociation of an associated STA in place (AP)
+
+IEEE 802.11-2020 11.3.5.5.  SparRAW FW 6.4 (capability
+WMI_FW_CAPABILITY_REASSOC_INPLACE, bit 28) answers a (Re)Association
+Request of a STA that is still associated in place instead of
+disassociating it, and reports it with WMI_CONNECT_EVENT for the same
+CID.  The driver enables that with WMI_REASSOC_INPLACE_CFG_CMDID (0x85b)
+after PCP start, and on such an event keeps the CID and its rings but
+resets what the STA resets on reassociation (11.3.5.4 c)): reorder
+buffers and duplicate detection, RX PN, TX block ack; closes the data
+port of a protected BSS until the new PTK; reports the STA to the SME
+again without deleting it, so hostapd runs a new 4-way handshake.
+--- a/drivers/net/wireless/ath/wil6210/cfg80211.c
++++ b/drivers/net/wireless/ath/wil6210/cfg80211.c
+@@ -2108,6 +2108,16 @@ static int _wil_cfg80211_start_ap(struct
+ 	if (rc)
+ 		goto err_bcast;
+ 
++	/* SparRAW FW 6.4: answer a (Re)Association Request of an associated
++	 * STA in place; this driver handles the WMI_CONNECT_EVENT that follows
++	 */
++	if (test_bit(WMI_FW_CAPABILITY_REASSOC_INPLACE, wil->fw_capabilities)) {
++		struct wmi_reassoc_inplace_cfg_cmd cfg = { .enable = 1 };
++
++		wmi_send(wil, WMI_REASSOC_INPLACE_CFG_CMDID, vif->mid,
++			 &cfg, sizeof(cfg));
++	}
++
+ 	goto out; /* success */
+ 
+ err_bcast:
+--- a/drivers/net/wireless/ath/wil6210/wmi.c
++++ b/drivers/net/wireless/ath/wil6210/wmi.c
+@@ -949,6 +949,71 @@ static void wmi_evt_scan_complete(struct
+ 	mutex_unlock(&wil->vif_mutex);
+ }
+ 
++/* The firmware answered a (Re)Association Request of an associated STA in
++ * place (IEEE 802.11-2020 11.3.5.5): the CID, its rings and beamforming stay.
++ * Reset what the STA itself resets on reassociation (11.3.5.4 c)): the
++ * reorder buffers and duplicate detection, the RX PN, the TX block ack
++ * agreements; close the data port of a protected BSS until the new PTK
++ * (WMI_RING_EN_EVENT opens it and requests TX BA again); report the STA to
++ * the SME again without deleting it, so hostapd renews the keys.
++ */
++static void wil_ap_reassoc_inplace(struct wil6210_priv *wil,
++				   struct wil6210_vif *vif, u8 cid,
++				   const u8 *req_ie, size_t req_ielen)
++{
++	struct net_device *ndev = vif_to_ndev(vif);
++	struct wil_sta_info *sta = &wil->sta[cid];
++	struct station_info *sinfo;
++	int i;
++
++	wil_info(wil, "reassoc: CID %d %pM reassociated in place\n", cid,
++		 sta->addr);
++
++	for (i = 0; i < WIL_STA_TID_NUM; i++) {
++		struct wil_tid_ampdu_rx *r;
++
++		spin_lock_bh(&sta->tid_rx_lock);
++		r = sta->tid_rx[i];
++		sta->tid_rx[i] = NULL;
++		wil_tid_ampdu_rx_free(wil, r);
++		spin_unlock_bh(&sta->tid_rx_lock);
++	}
++	memset(sta->tid_crypto_rx, 0, sizeof(sta->tid_crypto_rx));
++	memset(&sta->group_crypto_rx, 0, sizeof(sta->group_crypto_rx));
++
++	for (i = wil_get_min_tx_ring_id(wil); i < WIL6210_MAX_TX_RINGS; i++) {
++		struct wil_ring_tx_data *txdata = &wil->ring_tx_data[i];
++		u8 wsize;
++
++		if (wil->ring2cid_tid[i][0] != cid || !wil->ring_tx[i].va)
++			continue;
++		spin_lock_bh(&txdata->lock);
++		if (vif->privacy)
++			txdata->dot1x_open = false;
++		wsize = txdata->agg_wsize;
++		spin_unlock_bh(&txdata->lock);
++		if (wsize) {
++			/* open BSS: no new key, no WMI_RING_EN_EVENT — set BA
++			 * up again when the teardown is reported
++			 */
++			if (!vif->privacy)
++				txdata->reassoc_readd_wsize = wsize;
++			wmi_delba_tx(wil, vif->mid, i, WLAN_REASON_UNSPECIFIED);
++		}
++	}
++
++	sinfo = kzalloc(sizeof(*sinfo), GFP_KERNEL);
++	if (!sinfo)
++		return;
++	sinfo->generation = wil->sinfo_gen++;
++	if (req_ie) {
++		sinfo->assoc_req_ies = req_ie;
++		sinfo->assoc_req_ies_len = req_ielen;
++	}
++	cfg80211_new_sta(ndev->ieee80211_ptr, sta->addr, sinfo, GFP_KERNEL);
++	kfree(sinfo);
++}
++
+ static void wmi_evt_connect(struct wil6210_vif *vif, int id, void *d, int len)
+ {
+ 	struct wil6210_priv *wil = vif_to_wil(vif);
+@@ -1026,6 +1091,15 @@ static void wmi_evt_connect(struct wil62
+ 		timer_delete_sync(&vif->connect_timer);
+ 	} else if ((wdev->iftype == NL80211_IFTYPE_AP) ||
+ 		   (wdev->iftype == NL80211_IFTYPE_P2P_GO)) {
++		if (wil->sta[evt->cid].status == wil_sta_connected &&
++		    ether_addr_equal(wil->sta[evt->cid].addr, evt->bssid) &&
++		    test_bit(WMI_FW_CAPABILITY_REASSOC_INPLACE,
++			     wil->fw_capabilities)) {
++			wil_ap_reassoc_inplace(wil, vif, evt->cid,
++					       assoc_req_ie, assoc_req_ielen);
++			mutex_unlock(&wil->mutex);
++			return;
++		}
+ 		if (wil->sta[evt->cid].status != wil_sta_unused) {
+ 			wil_err(wil, "AP: Invalid status %d for CID %d\n",
+ 				wil->sta[evt->cid].status, evt->cid);
+@@ -1360,6 +1434,13 @@ static void wmi_evt_ba_status(struct wil
+ 	txdata->agg_wsize = evt->agg_wsize;
+ 	txdata->agg_amsdu = evt->amsdu;
+ 	txdata->addba_in_progress = false;
++
++	if (evt->status != WMI_BA_AGREED && txdata->reassoc_readd_wsize) {
++		u8 wsize = txdata->reassoc_readd_wsize;
++
++		txdata->reassoc_readd_wsize = 0;
++		wil_addba_tx_request(wil, evt->ringid, wsize);
++	}
+ }
+ 
+ static void wmi_evt_addba_rx_req(struct wil6210_vif *vif, int id,
+--- a/drivers/net/wireless/ath/wil6210/wmi.h
++++ b/drivers/net/wireless/ath/wil6210/wmi.h
+@@ -97,6 +97,8 @@ enum wmi_fw_capability {
+ 	WMI_FW_CAPABILITY_TX_REQ_EXT			= 25,
+ 	WMI_FW_CAPABILITY_CHANNEL_4			= 26,
+ 	WMI_FW_CAPABILITY_IPA				= 27,
++	/* SparRAW FW 6.4: reassociation of an associated STA in place */
++	WMI_FW_CAPABILITY_REASSOC_INPLACE		= 28,
+ 	WMI_FW_CAPABILITY_TEMPERATURE_ALL_RF		= 30,
+ 	WMI_FW_CAPABILITY_SPLIT_REKEY			= 31,
+ 	WMI_FW_CAPABILITY_MAX,
+@@ -203,6 +205,7 @@ enum wmi_command_id {
+ 	WMI_LED_CFG_CMDID				= 0x858,
+ 	/* SparRAW FW 6.4 mesh: BSSID of the DMG IBSS cell, sent before PCP_START */
+ 	WMI_IBSS_BSSID_CMDID				= 0x85a,
++	WMI_REASSOC_INPLACE_CFG_CMDID			= 0x85b,
+ 	WMI_SET_CONNECT_SNR_THR_CMDID			= 0x85B,
+ 	WMI_SET_ACTIVE_SILENT_RSSI_TABLE_CMDID		= 0x85C,
+ 	WMI_RF_PWR_ON_DELAY_CMDID			= 0x85D,
+@@ -821,6 +824,16 @@ struct wmi_ibss_bssid_cmd {
+ 	u8 reserved[2];
+ } __packed;
+ 
++/* WMI_REASSOC_INPLACE_CFG_CMDID (SparRAW FW 6.4, capability
++ * WMI_FW_CAPABILITY_REASSOC_INPLACE), no reply: the AP answers a
++ * (Re)Association Request of an associated STA in place and reports it with
++ * WMI_CONNECT_EVENT for the same CID (IEEE 802.11-2020 11.3.5.5)
++ */
++struct wmi_reassoc_inplace_cfg_cmd {
++	u8 enable;
++	u8 reserved[3];
++} __packed;
++
+ /* WMI_PCP_START_CMDID */
+ enum wmi_ap_sme_offload_mode {
+ 	/* Full AP SME in FW */
+--- a/drivers/net/wireless/ath/wil6210/wil6210.h
++++ b/drivers/net/wireless/ath/wil6210/wil6210.h
+@@ -639,6 +639,10 @@ struct wil_ring_tx_data {
+ 	int enabled;
+ 	cycles_t idle, last_idle, begin;
+ 	u8 agg_wsize; /* agreed aggregation window, 0 - no agg */
++	/* reassociation in place: set up TX BA again with this window once
++	 * the old agreement is torn down (WMI_BA_STATUS_EVENT)
++	 */
++	u8 reassoc_readd_wsize;
+ 	u16 agg_timeout;
+ 	u8 agg_amsdu;
+ 	bool addba_in_progress; /* if set, agg_xxx is for request in progress */

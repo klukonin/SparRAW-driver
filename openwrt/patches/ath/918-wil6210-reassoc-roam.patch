@@ -1,0 +1,215 @@
+wil6210: roaming without FT as a reassociation
+
+IEEE 802.11-2020 11.3.5.4: a STA that moves within the ESS reassociates.
+With firmware that cannot roam by FT (no WMI_FW_CAPABILITY_FT_ROAMING) a
+connect request while connected (auth type not FT) used to fail with
+-EOPNOTSUPP from wil_ft_connect().  Now the current association is
+dropped without reporting it to cfg80211 and WMI_CONNECT carries
+WMI_CONNECT_SEND_REASSOC; SparRAW FW 6.4 then sends a Reassociation
+Request with the old AP as Current AP Address.  Success is reported by
+cfg80211_roamed(), failure as a lost connection.
+--- a/drivers/net/wireless/ath/wil6210/cfg80211.c
++++ b/drivers/net/wireless/ath/wil6210/cfg80211.c
+@@ -1139,6 +1139,29 @@ static void wil_print_connect_params(str
+ 	wil_print_crypto(wil, &sme->crypto);
+ }
+ 
++static int wil_reassoc_leave(struct wil6210_priv *wil, struct wil6210_vif *vif)
++{
++	int i, rc;
++
++	wil_info(wil, "reassoc: roaming without FT, leaving the current AP\n");
++	vif->reassoc_roam = true;
++	vif->locally_generated_disc = true;
++	rc = wmi_call(wil, WMI_DISCONNECT_CMDID, vif->mid, NULL, 0,
++		      WMI_DISCONNECT_EVENTID, NULL, 0,
++		      WIL6210_DISCONNECT_TO_MS);
++	/* the disconnect event is handled by the WMI worker */
++	for (i = 0; i < 50 && !rc &&
++	     (test_bit(wil_vif_fwconnected, vif->status) ||
++	      test_bit(wil_vif_fwconnecting, vif->status)); i++)
++		msleep(10);
++	if (rc || test_bit(wil_vif_fwconnected, vif->status)) {
++		wil_err(wil, "reassoc: leaving the current AP failed (%d)\n", rc);
++		vif->reassoc_roam = false;
++		return rc ? rc : -EBUSY;
++	}
++	return 0;
++}
++
+ static int wil_ft_connect(struct wiphy *wiphy,
+ 			  struct net_device *ndev,
+ 			  struct cfg80211_connect_params *sme)
+@@ -1237,6 +1260,7 @@ static int wil_cfg80211_connect(struct w
+ 	int ch;
+ 	int rc = 0;
+ 	bool is_ft_roam = false;
++	bool reassoc = false;
+ 	u8 network_type;
+ 	enum ieee80211_bss_type bss_type = IEEE80211_BSS_TYPE_ESS;
+ 
+@@ -1249,7 +1273,21 @@ static int wil_cfg80211_connect(struct w
+ 	    test_bit(wil_vif_fwconnected, vif->status))
+ 		is_ft_roam = true;
+ 
+-	if (!is_ft_roam)
++	/* Roaming within the ESS without FT (IEEE 802.11-2020 11.3.5.4):
++	 * firmware that cannot roam by FT gets a reassociation instead.  The
++	 * current association is dropped without telling cfg80211 and the
++	 * new one is requested with WMI_CONNECT_SEND_REASSOC; the firmware
++	 * sends a Reassociation Request with the old AP as Current AP Address.
++	 */
++	if ((is_ft_roam ||
++	     (sme->prev_bssid && test_bit(wil_vif_fwconnected, vif->status))) &&
++	    sme->auth_type != NL80211_AUTHTYPE_FT &&
++	    !test_bit(WMI_FW_CAPABILITY_FT_ROAMING, wil->fw_capabilities)) {
++		is_ft_roam = false;
++		reassoc = true;
++	}
++
++	if (!is_ft_roam && !reassoc)
+ 		if (test_bit(wil_vif_fwconnecting, vif->status) ||
+ 		    test_bit(wil_vif_fwconnected, vif->status))
+ 			return -EALREADY;
+@@ -1345,6 +1383,13 @@ static int wil_cfg80211_connect(struct w
+ 		}
+ 	}
+ 
++	/* leave the current AP only now, after every check that may fail */
++	if (reassoc) {
++		rc = wil_reassoc_leave(wil, vif);
++		if (rc)
++			goto out;
++	}
++
+ 	/* WMI_CONNECT_CMD */
+ 	memset(&conn, 0, sizeof(conn));
+ 	conn.network_type = network_type;
+@@ -1376,6 +1421,8 @@ static int wil_cfg80211_connect(struct w
+ 
+ 	ether_addr_copy(conn.bssid, bss->bssid);
+ 	ether_addr_copy(conn.dst_mac, bss->bssid);
++	if (vif->reassoc_roam)
++		conn.ctrl_flags |= cpu_to_le32(WMI_CONNECT_SEND_REASSOC);
+ 
+ 	/* dot11MaxLostBeacons of the BSS (802.11-2020 11.1.3.1): the STA
+ 	 * expects a DMG Beacon at least every dot11BeaconPeriod *
+@@ -1418,6 +1465,14 @@ static int wil_cfg80211_connect(struct w
+ 	}
+ 
+  out:
++	/* the old association is gone: a failed reassociation is a loss of
++	 * the connection for cfg80211
++	 */
++	if (rc && vif->reassoc_roam) {
++		vif->reassoc_roam = false;
++		cfg80211_disconnected(ndev, WLAN_REASON_UNSPECIFIED, NULL, 0,
++				      true, GFP_KERNEL);
++	}
+ 	cfg80211_put_bss(wiphy, bss);
+ 
+ 	return rc;
+--- a/drivers/net/wireless/ath/wil6210/main.c
++++ b/drivers/net/wireless/ath/wil6210/main.c
+@@ -388,15 +388,27 @@ static void _wil6210_disconnect_complete
+ 
+ 		if (test_and_clear_bit(wil_vif_fwconnected, vif->status)) {
+ 			atomic_dec(&wil->connected_vifs);
+-			cfg80211_disconnected(ndev, reason_code,
+-					      NULL, 0,
+-					      vif->locally_generated_disc,
+-					      GFP_KERNEL);
++			/* leaving the old AP for a reassociation: cfg80211
++			 * still considers the STA connected (it roams)
++			 */
++			if (!vif->reassoc_roam)
++				cfg80211_disconnected(ndev, reason_code,
++						      NULL, 0,
++						      vif->locally_generated_disc,
++						      GFP_KERNEL);
+ 			vif->locally_generated_disc = false;
+ 		} else if (test_bit(wil_vif_fwconnecting, vif->status)) {
+-			cfg80211_connect_result(ndev, bssid, NULL, 0, NULL, 0,
+-						WLAN_STATUS_UNSPECIFIED_FAILURE,
+-						GFP_KERNEL);
++			if (vif->reassoc_roam) {
++				vif->reassoc_roam = false;
++				cfg80211_disconnected(ndev, reason_code,
++						      NULL, 0, true,
++						      GFP_KERNEL);
++			} else {
++				cfg80211_connect_result(ndev, bssid, NULL, 0,
++							NULL, 0,
++							WLAN_STATUS_UNSPECIFIED_FAILURE,
++							GFP_KERNEL);
++			}
+ 			vif->bss = NULL;
+ 		}
+ 		clear_bit(wil_vif_fwconnecting, vif->status);
+--- a/drivers/net/wireless/ath/wil6210/wil6210.h
++++ b/drivers/net/wireless/ath/wil6210/wil6210.h
+@@ -867,6 +867,11 @@ struct wil6210_vif {
+ 	int bcast_ring;
+ 	struct cfg80211_bss *bss; /* connected bss, relevant in STA mode */
+ 	int locally_generated_disc; /* relevant in STA mode */
++	/* STA: roaming without FT — the old association is dropped silently
++	 * and WMI_CONNECT carries WMI_CONNECT_SEND_REASSOC; the result is
++	 * reported as a roam (IEEE 802.11-2020 11.3.5.4)
++	 */
++	bool reassoc_roam;
+ 	struct timer_list connect_timer;
+ 	struct work_struct disconnect_worker;
+ 	/* scan */
+--- a/drivers/net/wireless/ath/wil6210/wmi.c
++++ b/drivers/net/wireless/ath/wil6210/wmi.c
+@@ -1053,6 +1053,15 @@ static void wmi_evt_connect(struct wil62
+ 		if (rc) {
+ 			netif_carrier_off(ndev);
+ 			wil6210_bus_request(wil, WIL_DEFAULT_BUS_REQUEST_KBPS);
++			if (vif->reassoc_roam) {
++				vif->reassoc_roam = false;
++				wil_err(wil, "reassoc: failed, connection lost\n");
++				cfg80211_disconnected(ndev,
++						      WLAN_REASON_UNSPECIFIED,
++						      NULL, 0, true,
++						      GFP_KERNEL);
++				goto out;
++			}
+ 			wil_err(wil, "cfg80211_connect_result with failure\n");
+ 			cfg80211_connect_result(ndev, evt->bssid, NULL, 0,
+ 						NULL, 0,
+@@ -1067,11 +1076,29 @@ static void wmi_evt_connect(struct wil62
+ 				queue_work(wil->wmi_wq, &vif->lm_cfg_worker);
+ 			}
+ 			cfg80211_ref_bss(wiphy, vif->bss);
+-			cfg80211_connect_bss(ndev, evt->bssid, vif->bss,
+-					     assoc_req_ie, assoc_req_ielen,
+-					     assoc_resp_ie, assoc_resp_ielen,
+-					     WLAN_STATUS_SUCCESS, GFP_KERNEL,
+-					     NL80211_TIMEOUT_UNSPECIFIED);
++			if (vif->reassoc_roam) {
++				struct cfg80211_roam_info info = {};
++
++				vif->reassoc_roam = false;
++				wil_info(wil, "reassoc: roamed to %pM\n",
++					 evt->bssid);
++				info.links[0].bss = vif->bss;
++				info.links[0].channel = vif->bss->channel;
++				info.req_ie = assoc_req_ie;
++				info.req_ie_len = assoc_req_ielen;
++				info.resp_ie = assoc_resp_ie;
++				info.resp_ie_len = assoc_resp_ielen;
++				cfg80211_roamed(ndev, &info, GFP_KERNEL);
++			} else {
++				cfg80211_connect_bss(ndev, evt->bssid, vif->bss,
++						     assoc_req_ie,
++						     assoc_req_ielen,
++						     assoc_resp_ie,
++						     assoc_resp_ielen,
++						     WLAN_STATUS_SUCCESS,
++						     GFP_KERNEL,
++						     NL80211_TIMEOUT_UNSPECIFIED);
++			}
+ 		}
+ 		vif->bss = NULL;
+ 	} else if ((wdev->iftype == NL80211_IFTYPE_AP) ||

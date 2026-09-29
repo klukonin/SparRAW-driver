@@ -1,0 +1,152 @@
+--- a/drivers/net/wireless/ath/wil6210/cfg80211.c
++++ b/drivers/net/wireless/ath/wil6210/cfg80211.c
+@@ -1377,6 +1377,20 @@ static int wil_cfg80211_connect(struct w
+ 	ether_addr_copy(conn.bssid, bss->bssid);
+ 	ether_addr_copy(conn.dst_mac, bss->bssid);
+ 
++	/* dot11MaxLostBeacons of the BSS (802.11-2020 11.1.3.1): the STA
++	 * expects a DMG Beacon at least every dot11BeaconPeriod *
++	 * dot11MaxLostBeacons TUs.  The AP advertises it in the last octet
++	 * of the DMG BSS Parameter Configuration field of its DMG Operation
++	 * element (9.4.2.128, Figures 9-555/9-557): body = 2 octets DMG
++	 * Operation Information + 8 octets configuration.
++	 */
++	{
++		const u8 *op = ieee80211_bss_get_ie(bss, WLAN_EID_DMG_OPERATION);
++
++		vif->max_lost_beacons = (op && op[1] >= 10) ? op[2 + 9] : 0;
++		wil_info(wil, "BSS MaxLostBeacons %u\n", vif->max_lost_beacons);
++	}
++
+ 	/* Adopt the AP's beacon period when joining (802.11-2020 11.1.3.3.1).
+ 	 * Sparrow FW 6.2 programs the STA BI timer from it at WMI_CONNECT; see
+ 	 * wmi_set_sta_bcon_int().
+--- a/drivers/net/wireless/ath/wil6210/netdev.c
++++ b/drivers/net/wireless/ath/wil6210/netdev.c
+@@ -208,6 +208,7 @@ static void wil_vif_deinit(struct wil621
+ 	wil_probe_client_flush(vif);
+ 	cancel_work_sync(&vif->probe_client_worker);
+ 	cancel_work_sync(&vif->enable_tx_key_worker);
++	cancel_work_sync(&vif->lm_cfg_worker);
+ }
+ 
+ void wil_vif_free(struct wil6210_vif *vif)
+@@ -277,6 +278,7 @@ static void wil_vif_init(struct wil6210_
+ 	INIT_WORK(&vif->p2p.discovery_expired_work, wil_p2p_listen_expired);
+ 	INIT_WORK(&vif->p2p.delayed_listen_work, wil_p2p_delayed_listen_work);
+ 	INIT_WORK(&vif->enable_tx_key_worker, wil_enable_tx_key_worker);
++	INIT_WORK(&vif->lm_cfg_worker, wil_lm_cfg_worker);
+ 
+ 	INIT_LIST_HEAD(&vif->probe_client_pending);
+ 
+@@ -539,6 +541,7 @@ void wil_vif_remove(struct wil6210_priv
+ 	wil_probe_client_flush(vif);
+ 	cancel_work_sync(&vif->probe_client_worker);
+ 	cancel_work_sync(&vif->enable_tx_key_worker);
++	cancel_work_sync(&vif->lm_cfg_worker);
+ 	/* for VIFs, ndev will be freed by destructor after RTNL is unlocked.
+ 	 * the main interface will be freed in wil_if_free, we need to keep it
+ 	 * a bit longer so logging macros will work.
+--- a/drivers/net/wireless/ath/wil6210/wil6210.h
++++ b/drivers/net/wireless/ath/wil6210/wil6210.h
+@@ -884,6 +884,15 @@ struct wil6210_vif {
+ 	/* PTK rekey race prevention, this is relevant to station mode only */
+ 	enum wil_rekey_state ptk_rekey_state;
+ 	struct work_struct enable_tx_key_worker;
++
++	/* STA: dot11MaxLostBeacons of the joined BSS, from the MaxLostBeacons
++	 * subfield of its DMG Operation element (802.11-2020 9.4.2.128);
++	 * 0 - not advertised.  Applied to the FW link-loss detector after
++	 * the connection is up (lm_cfg_worker).
++	 */
++	u8 max_lost_beacons;
++	u8 lm_cfg_cid;
++	struct work_struct lm_cfg_worker;
+ };
+ 
+ /*
+@@ -1372,6 +1381,7 @@ void wil_probe_client_flush(struct wil62
+ void wil_probe_client_worker(struct work_struct *work);
+ void wil_disconnect_worker(struct work_struct *work);
+ void wil_enable_tx_key_worker(struct work_struct *work);
++void wil_lm_cfg_worker(struct work_struct *work);
+ 
+ void wil_init_txrx_ops(struct wil6210_priv *wil);
+ 
+--- a/drivers/net/wireless/ath/wil6210/wmi.c
++++ b/drivers/net/wireless/ath/wil6210/wmi.c
+@@ -1062,6 +1062,10 @@ static void wmi_evt_connect(struct wil62
+ 		} else {
+ 			struct wiphy *wiphy = wil_to_wiphy(wil);
+ 
++			if (vif->max_lost_beacons) {
++				vif->lm_cfg_cid = evt->cid;
++				queue_work(wil->wmi_wq, &vif->lm_cfg_worker);
++			}
+ 			cfg80211_ref_bss(wiphy, vif->bss);
+ 			cfg80211_connect_bss(ndev, evt->bssid, vif->bss,
+ 					     assoc_req_ie, assoc_req_ielen,
+@@ -2149,6 +2153,63 @@ int wmi_set_sta_bcon_int(struct wil6210_
+ 			WIL_WMI_CALL_GENERAL_TO_MS);
+ }
+ 
++/* Make the FW link-loss detector follow dot11MaxLostBeacons of the joined
++ * BSS: the "bad beacons" detector disconnects after that many consecutive
++ * beacon intervals without a beacon from the AP.  Read the connection's
++ * current settings and write them back with only the threshold changed.
++ * Runs from wmi_wq: wmi_call() cannot be used from the event handler.
++ */
++void wil_lm_cfg_worker(struct work_struct *work)
++{
++	struct wil6210_vif *vif = container_of(work, struct wil6210_vif,
++					       lm_cfg_worker);
++	struct wil6210_priv *wil = vif_to_wil(vif);
++	u8 cid = vif->lm_cfg_cid, max_lost = vif->max_lost_beacons;
++	struct wmi_link_maintain_cfg_read_cmd rd = { .cid = cpu_to_le32(cid) };
++	struct {
++		struct wmi_cmd_hdr wmi;
++		struct wmi_link_maintain_cfg_read_done_event evt;
++	} __packed rd_reply = {
++		.evt = {.status = cpu_to_le32(WMI_LINK_MAINTAIN_CFG_RESPONSE_STATUS_BAD_ARGUMENT)},
++	};
++	struct wmi_link_maintain_cfg_write_cmd wr = {
++		.cfg_type = cpu_to_le32(WMI_LINK_MAINTAIN_CFG_TYPE_CUSTOM),
++		.cid = cpu_to_le32(cid),
++	};
++	struct {
++		struct wmi_cmd_hdr wmi;
++		struct wmi_link_maintain_cfg_write_done_event evt;
++	} __packed wr_reply = {
++		.evt = {.status = cpu_to_le32(WMI_LINK_MAINTAIN_CFG_RESPONSE_STATUS_BAD_ARGUMENT)},
++	};
++	int rc;
++
++	if (!max_lost)
++		return;
++
++	rc = wmi_call(wil, WMI_LINK_MAINTAIN_CFG_READ_CMDID, vif->mid,
++		      &rd, sizeof(rd), WMI_LINK_MAINTAIN_CFG_READ_DONE_EVENTID,
++		      &rd_reply, sizeof(rd_reply), WIL_WMI_CALL_GENERAL_TO_MS);
++	if (rc || rd_reply.evt.status) {
++		wil_err(wil, "link maintain cfg read cid %d: rc %d status %d\n",
++			cid, rc, le32_to_cpu(rd_reply.evt.status));
++		return;
++	}
++
++	wr.lm_cfg = rd_reply.evt.lm_cfg;
++	wr.lm_cfg.bad_beacons_num_threshold = cpu_to_le32(max_lost);
++	rc = wmi_call(wil, WMI_LINK_MAINTAIN_CFG_WRITE_CMDID, vif->mid,
++		      &wr, sizeof(wr), WMI_LINK_MAINTAIN_CFG_WRITE_DONE_EVENTID,
++		      &wr_reply, sizeof(wr_reply), WIL_WMI_CALL_GENERAL_TO_MS);
++	if (rc || wr_reply.evt.status)
++		wil_err(wil, "link maintain cfg write cid %d: rc %d status %d\n",
++			cid, rc, le32_to_cpu(wr_reply.evt.status));
++	else
++		wil_info(wil, "cid %d: bad_beacons_num_threshold %u (was %u) = MaxLostBeacons of the BSS\n",
++			 cid, max_lost,
++			 le32_to_cpu(rd_reply.evt.lm_cfg.bad_beacons_num_threshold));
++}
++
+ int wmi_echo(struct wil6210_priv *wil)
+ {
+ 	struct wil6210_vif *vif = ndev_to_vif(wil->main_ndev);

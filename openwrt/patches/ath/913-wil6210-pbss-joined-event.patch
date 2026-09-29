@@ -1,0 +1,55 @@
+--- a/drivers/net/wireless/ath/wil6210/wmi.c
++++ b/drivers/net/wireless/ath/wil6210/wmi.c
+@@ -1118,6 +1118,44 @@ out:
+ 	mutex_unlock(&wil->mutex);
+ }
+ 
++/* Sparrow FW 4.1 "Direct Connection": a PBSS member STA associates with a
++ * beamformed peer on its own (no Assoc frames) and reports it with this
++ * vendor event instead of WMI_CONNECT_EVENTID.  FW: l2mgr__send_pbss_joined_evt
++ * @0x8eea68, 12-byte body.
++ */
++#define WMI_PBSS_JOINED_EVENTID	(0x0015)
++
++struct wmi_pbss_joined_event {
++	u8 channel;		/* bss channel index, as in wmi_connect_event */
++	u8 reserved0;
++	u8 addr[WMI_MAC_LEN];	/* peer MAC */
++	u8 network_type;
++	u8 cid;
++	u8 reserved1[2];
++} __packed;
++
++static void wmi_evt_pbss_joined(struct wil6210_vif *vif, int id,
++				void *d, int len)
++{
++	struct wil6210_priv *wil = vif_to_wil(vif);
++	struct wmi_pbss_joined_event *evt = d;
++	struct wmi_connect_event conn = {};
++
++	if (len < sizeof(*evt)) {
++		wil_err(wil, "PBSS joined event too short : %d bytes\n", len);
++		return;
++	}
++	wil_info(wil, "PBSS joined (direct) %pM channel %d cid %d nettype 0x%x\n",
++		 evt->addr, evt->channel + 1, evt->cid, evt->network_type);
++
++	conn.channel = evt->channel;
++	ether_addr_copy(conn.bssid, evt->addr);
++	conn.network_type = evt->network_type;
++	conn.cid = evt->cid;
++	conn.aid = evt->cid + 1;
++	wmi_evt_connect(vif, WMI_CONNECT_EVENTID, &conn, sizeof(conn));
++}
++
+ static void wmi_evt_disconnect(struct wil6210_vif *vif, int id,
+ 			       void *d, int len)
+ {
+@@ -1890,6 +1928,7 @@ static const struct {
+ 	{WMI_DELBA_EVENTID,		wmi_evt_delba},
+ 	{WMI_RING_EN_EVENTID,		wmi_evt_ring_en},
+ 	{WMI_DATA_PORT_OPEN_EVENTID,		wmi_evt_ignore},
++	{WMI_PBSS_JOINED_EVENTID,		wmi_evt_pbss_joined},
+ 	{WMI_SCHED_SCAN_RESULT_EVENTID,		wmi_evt_sched_scan_result},
+ 	{WMI_LINK_STATS_EVENTID,		wmi_evt_link_stats},
+ 	{WMI_FT_AUTH_STATUS_EVENTID,		wmi_evt_auth_status},

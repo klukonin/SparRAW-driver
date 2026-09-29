@@ -1,0 +1,115 @@
+wil6210: arm the ucode trace ring as well
+
+The device keeps two independent log rings: the firmware publishes one in
+RGF_USER_USAGE_1 and the ucode a second one in RGF_USER_USAGE_2, with the
+same header layout. Only the first was being armed.
+
+The ucode ring is the interesting one for DMG work: the beacon machinery
+logs from there - bti_worker::bti_transmitter_beacon_sweep_flow() with its
+"randomize beacon", "current_tsf / Next tsf / uniform_random" and "Beacons
+delay due to NAV started at" lines, plus TSF events and TX eligibility. The
+string table for it ships as record type 100 of the vendor image.
+
+Arm both from the same level; a missing ucode ring is not fatal.
+--- a/drivers/net/wireless/ath/wil6210/main.c
++++ b/drivers/net/wireless/ath/wil6210/main.c
+@@ -1661,9 +1661,13 @@ void wil_clear_fw_log_addr(struct wil621
+ /* Locate the FW log ring header in the BAR; NULL if the FW has not published
+  * it yet or it falls outside the known FW mappings.
+  */
+-static void __iomem *wil_fw_log_ring(struct wil6210_priv *wil)
++/* @fw: the address comes from the firmware's address space, not the ucode's.
++ * Both use 0x800000 for their data RAM but they land in different windows,
++ * so picking the wrong mapping writes into the other processor's memory.
++ */
++static void __iomem *wil_log_ring(struct wil6210_priv *wil, u32 reg, bool fw)
+ {
+-	u32 addr = wil_r(wil, RGF_USER_USAGE_1);
++	u32 addr = wil_r(wil, reg);
+ 	int i;
+ 
+ 	if (!addr)
+@@ -1672,45 +1676,64 @@ static void __iomem *wil_fw_log_ring(str
+ 	for (i = 0; i < ARRAY_SIZE(fw_mapping); i++) {
+ 		struct fw_map *map = &fw_mapping[i];
+ 
+-		if (!map->to || addr < map->from || addr >= map->to)
++		if (!map->to || map->fw != fw ||
++		    addr < map->from || addr >= map->to)
+ 			continue;
+ 		return (u8 __iomem *)wil->csr + HOSTADDR(map->host) +
+ 		       (addr - map->from);
+ 	}
+ 
+-	wil_err(wil, "FW log address 0x%08x outside FW mappings\n", addr);
++	wil_err(wil, "log ring address 0x%08x outside FW mappings\n", addr);
+ 	return NULL;
+ }
+ 
+-void wil_fw_log_enable(struct wil6210_priv *wil, u8 level)
++static void __iomem *wil_fw_log_ring(struct wil6210_priv *wil)
+ {
+-	void __iomem *dst;
+-	u32 word;
++	return wil_log_ring(wil, RGF_USER_USAGE_1, true);
++}
++
++/* Arm one log ring: the header is { u32 write_ptr; u8 module_level[16]; } */
++static bool wil_log_ring_arm(struct wil6210_priv *wil, u32 reg, bool fw,
++			     u8 level, const char *what)
++{
++	void __iomem *dst = wil_log_ring(wil, reg, fw);
++	u32 word = level * 0x01010101u;
+ 	int i;
+ 
++	if (!dst)
++		return false;
++
++	for (i = 0; i < 16; i += 4)
++		writel(word, (u8 __iomem *)dst + sizeof(u32) + i);
++	/* levels must land before the FW next looks at them */
++	wmb();
++	wil_info(wil, "%s log enabled at 0x%08x, level mask 0x%02x\n",
++		 what, wil_r(wil, reg), level);
++	return true;
++}
++
++void wil_fw_log_enable(struct wil6210_priv *wil, u8 level)
++{
+ 	if (!level)
+ 		return;
+ 
+-	dst = wil_fw_log_ring(wil);
+-	if (!dst) {
++	if (!wil_log_ring_arm(wil, RGF_USER_USAGE_1, true, level, "FW")) {
+ 		wil_err(wil, "FW log address not published by FW\n");
+ 		return;
+ 	}
+ 
+-	/* remember it: the level can also come from debugfs, and the watchdog
+-	 * needs to know whether the marker is armed at all
++	/* The ucode keeps a second, separate ring - that is where the beacon
++	 * machinery logs from (bti_worker, TSF events, TX eligibility), so it
++	 * is the interesting one for DMG work. Its absence is not fatal.
+ 	 */
+-	wil->fw_log_level = level;
+-
+-	/* one level byte per module, all set the same */
+-	word = level * 0x01010101u;
+-	for (i = 0; i < 16; i += 4)
+-		writel(word, (u8 __iomem *)dst + sizeof(u32) + i);
+-	/* the levels must land before the FW next looks at them */
+-	wmb();
++	/* The ucode ring lives in the ucode's own data RAM and its layout is
++	 * different: { u32 write_index; u8 enable; ... } with the entries at
++	 * +0x14. Vendor 4.1 images ship it already enabled, so this only has
++	 * to set the enable byte, and never through the FW mapping.
++	 */
++	wil_log_ring_arm(wil, RGF_USER_USAGE_2, false, level, "ucode");
+ 
+-	wil_info(wil, "FW log enabled at 0x%08x, level mask 0x%02x\n",
+-		 wil_r(wil, RGF_USER_USAGE_1), level);
++	wil->fw_log_level = level;
+ }
+ 
+ /*

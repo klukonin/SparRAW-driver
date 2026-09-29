@@ -1,0 +1,65 @@
+wil6210: fall back to the generic Sparrow firmware image
+
+The driver derives the firmware file name from the chip revision, so a
+Sparrow D0 ("Sparrow plus") card asks for wil6210_sparrow_plus.fw.
+linux-firmware only ships wil6210.fw, so on such cards the load fails
+with -ENOENT and the device never comes up:
+
+  Direct firmware load for wil6210_sparrow_plus.fw failed with error -2
+  wmi_call(0x0822->0x1821) timeout 100 msec
+  Failed to set beacon parameters
+
+This is what the MikroTik wAP 60Gx3 (HW version 0x2) hits, while the
+otherwise identical wAP 60G (HW version 0x1) works; the vendor driver
+loads a single image for every Sparrow revision.
+
+Retry with the generic image when the revision specific one is absent.
+The mapping is confined to the Sparrow family, so a Talyn image (a
+different chip, not interchangeable) is never substituted, and the FTM
+variant falls back to the FTM image rather than to the regular one.
+
+--- a/drivers/net/wireless/ath/wil6210/main.c
++++ b/drivers/net/wireless/ath/wil6210/main.c
+@@ -1285,6 +1285,22 @@
+ 	le32_to_cpus(&r->head);
+ }
+ 
++/* Generic image to use when the revision specific one is not installed.
++ * Only defined within the Sparrow family: a Talyn image is not a valid
++ * substitute for a Sparrow one and vice versa.
++ */
++static const char *wil_fw_name_generic(const char *name)
++{
++	if (!name)
++		return NULL;
++	if (strcmp(name, WIL_FW_NAME_SPARROW_PLUS) == 0)
++		return WIL_FW_NAME_DEFAULT;
++	if (strcmp(name, WIL_FW_NAME_FTM_SPARROW_PLUS) == 0)
++		return WIL_FW_NAME_FTM_DEFAULT;
++
++	return NULL;
++}
++
+ /* construct actual board file name to use */
+ void wil_get_board_file(struct wil6210_priv *wil, char *buf, size_t len)
+ {
+@@ -1719,6 +1735,19 @@
+ 		memset(wil->fw_version, 0, sizeof(wil->fw_version));
+ 		/* Loading f/w from the file */
+ 		rc = wil_request_firmware(wil, wil->wil_fw_name, true);
++		if (rc == -ENOENT) {
++			const char *fallback =
++				wil_fw_name_generic(wil->wil_fw_name);
++
++			if (fallback) {
++				wil_info(wil, "<%s> is missing, using <%s>\n",
++					 wil->wil_fw_name, fallback);
++				wil->wil_fw_name = fallback;
++				rc = wil_request_firmware(wil,
++							  wil->wil_fw_name,
++							  true);
++			}
++		}
+ 		if (rc)
+ 			goto out;
+ 		if (wil->num_of_brd_entries)
