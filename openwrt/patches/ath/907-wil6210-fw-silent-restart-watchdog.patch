@@ -1,0 +1,247 @@
+wil6210: notice a firmware that restarts behind the host's back, and recover it
+
+Under sustained TX load the firmware has been seen to restart itself without
+reporting it: no assert code, no event - the TX ring stays stopped, counters
+freeze, and WMI only starts timing out once something asks the firmware for
+anything. By then resetting the device hangs the whole board and only a power
+cycle brings it back, so the restart has to be caught while the chip is still
+sane.
+
+The restart is visible in the FW log ring header, which costs one read to
+check: the per-module level bytes are written by the driver and nobody else,
+so a firmware that came up fresh has all of them zeroed.
+
+Poll them every fw_watchdog_ms and hand the device to the existing FW error
+recovery path, the same one the assert interrupt uses. Needs the FW log armed
+(module parameter or debugfs); 0, the default, keeps the watchdog off.
+
+A write pointer that stands still is deliberately not taken as a hang: FW
+6.2, and a 4.1 station before association, log nothing for seconds at a time,
+and such a check reset healthy links every 6-18 s.
+--- a/drivers/net/wireless/ath/wil6210/debugfs.c
++++ b/drivers/net/wireless/ath/wil6210/debugfs.c
+@@ -1557,6 +1557,10 @@ static ssize_t wil_write_file_fw_log_lev
+ 		return rc;
+ 
+ 	wil_fw_log_enable(wil, level);
++	/* the level bytes double as the liveness marker, so this is also the
++	 * point where the silent-restart watchdog can start without a reset
++	 */
++	wil_fw_watchdog_start(wil);
+ 
+ 	return count;
+ }
+--- a/drivers/net/wireless/ath/wil6210/main.c
++++ b/drivers/net/wireless/ath/wil6210/main.c
+@@ -38,6 +38,13 @@ module_param(fw_log_level, byte, 0644);
+ MODULE_PARM_DESC(fw_log_level,
+ 		 " FW trace level mask stored into the FW log ring header: bit0 error, bit1 warn, bit2 info, bit3 verbose. 0 (default) leaves FW logging off");
+ 
++static void wil_fw_watchdog_work(struct work_struct *work);
++
++static uint fw_watchdog_ms;
++module_param(fw_watchdog_ms, uint, 0644);
++MODULE_PARM_DESC(fw_watchdog_ms,
++		 " poll interval in ms for catching a silent FW restart and recovering from it; 0 (default) disables. Needs fw_log_level set - the log level bytes are the liveness marker");
++
+ /* if not set via modparam, will be set to default value of 1/8 of
+  * rx ring size during init flow
+  */
+@@ -714,6 +721,7 @@ int wil_priv_init(struct wil6210_priv *w
+ 
+ 	INIT_WORK(&wil->wmi_event_worker, wmi_event_worker);
+ 	INIT_WORK(&wil->fw_error_worker, wil_fw_error_worker);
++	INIT_DELAYED_WORK(&wil->fw_watchdog_work, wil_fw_watchdog_work);
+ 
+ 	INIT_LIST_HEAD(&wil->pending_wmi_ev);
+ 	spin_lock_init(&wil->wmi_ev_lock);
+@@ -831,6 +839,7 @@ void wil_priv_deinit(struct wil6210_priv
+ 	wil_dbg_misc(wil, "priv_deinit\n");
+ 
+ 	wil_set_recovery_state(wil, fw_recovery_idle);
++	cancel_delayed_work_sync(&wil->fw_watchdog_work);
+ 	cancel_work_sync(&wil->fw_error_worker);
+ 	wmi_event_flush(wil);
+ 	destroy_workqueue(wil->wq_service);
+@@ -1628,37 +1637,50 @@ void wil_clear_fw_log_addr(struct wil621
+  * exactly the operation that wedges the board in that state - so the same
+  * function is exposed through debugfs to be called without any reset.
+  */
+-void wil_fw_log_enable(struct wil6210_priv *wil, u8 level)
++/* Locate the FW log ring header in the BAR; NULL if the FW has not published
++ * it yet or it falls outside the known FW mappings.
++ */
++static void __iomem *wil_fw_log_ring(struct wil6210_priv *wil)
+ {
+ 	u32 addr = wil_r(wil, RGF_USER_USAGE_1);
+-	void __iomem *dst = NULL;
+-	u32 word;
+ 	int i;
+ 
+-	if (!level)
+-		return;
+-
+-	if (!addr) {
+-		wil_err(wil, "FW log address not published by FW\n");
+-		return;
+-	}
++	if (!addr)
++		return NULL;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(fw_mapping); i++) {
+ 		struct fw_map *map = &fw_mapping[i];
+ 
+ 		if (!map->to || addr < map->from || addr >= map->to)
+ 			continue;
+-		dst = (u8 __iomem *)wil->csr + HOSTADDR(map->host) +
+-		      (addr - map->from);
+-		break;
++		return (u8 __iomem *)wil->csr + HOSTADDR(map->host) +
++		       (addr - map->from);
+ 	}
+ 
++	wil_err(wil, "FW log address 0x%08x outside FW mappings\n", addr);
++	return NULL;
++}
++
++void wil_fw_log_enable(struct wil6210_priv *wil, u8 level)
++{
++	void __iomem *dst;
++	u32 word;
++	int i;
++
++	if (!level)
++		return;
++
++	dst = wil_fw_log_ring(wil);
+ 	if (!dst) {
+-		wil_err(wil, "FW log address 0x%08x outside FW mappings\n",
+-			addr);
++		wil_err(wil, "FW log address not published by FW\n");
+ 		return;
+ 	}
+ 
++	/* remember it: the level can also come from debugfs, and the watchdog
++	 * needs to know whether the marker is armed at all
++	 */
++	wil->fw_log_level = level;
++
+ 	/* one level byte per module, all set the same */
+ 	word = level * 0x01010101u;
+ 	for (i = 0; i < 16; i += 4)
+@@ -1667,7 +1689,78 @@ void wil_fw_log_enable(struct wil6210_pr
+ 	wmb();
+ 
+ 	wil_info(wil, "FW log enabled at 0x%08x, level mask 0x%02x\n",
+-		 addr, level);
++		 wil_r(wil, RGF_USER_USAGE_1), level);
++}
++
++/* All 16 per-module level bytes zero: nobody armed this ring, i.e. the FW
++ * came up fresh.  Checking all of them keeps a partially muted log (some
++ * modules set to 0 on purpose) from looking like a restart.
++ */
++static bool wil_fw_log_levels_zeroed(void __iomem *ring)
++{
++	int i;
++
++	for (i = 0; i < 16; i += 4)
++		if (readl((u8 __iomem *)ring + sizeof(u32) + i))
++			return false;
++	return true;
++}
++
++/*
++ * Catch a firmware restart that the firmware does not report.
++ *
++ * Under sustained TX load the FW has been seen to restart itself without
++ * raising the error interrupt: no assert code, no event, the TX ring simply
++ * stays stopped and WMI only starts timing out once something asks the FW for
++ * anything. By then resetting the device hangs the board and only a power
++ * cycle recovers it, so the restart has to be noticed while the chip is still
++ * sane.
++ *
++ * The marker is the FW log level bytes: they live in FW RAM, the driver is
++ * their only writer, and a restarted FW comes up with them zeroed.
++ *
++ * A write pointer that stands still is NOT treated as a hang: FW 6.2, and a
++ * 4.1 station before association, legitimately log nothing for seconds, and
++ * such a check reset healthy links every 6-18 s.
++ */
++static void wil_fw_watchdog_work(struct work_struct *work)
++{
++	struct wil6210_priv *wil = container_of(work, struct wil6210_priv,
++						fw_watchdog_work.work);
++	void __iomem *ring;
++
++	if (!fw_watchdog_ms || !wil->fw_log_level)
++		return;
++
++	if (test_bit(wil_status_fwready, wil->status) &&
++	    !test_bit(wil_status_resetting, wil->status)) {
++		ring = wil_fw_log_ring(wil);
++		if (ring && wil_fw_log_levels_zeroed(ring)) {
++			wil_err(wil,
++				"FW restarted without notifying the host, recovering\n");
++			wil_fw_error_recovery(wil);
++			return;
++		}
++	}
++
++	schedule_delayed_work(&wil->fw_watchdog_work,
++			      msecs_to_jiffies(fw_watchdog_ms));
++}
++
++void wil_fw_watchdog_start(struct wil6210_priv *wil)
++{
++	if (!fw_watchdog_ms)
++		return;
++
++	if (!wil->fw_log_level) {
++		wil_err(wil,
++			"fw_watchdog_ms needs the FW log armed, watchdog not started\n");
++		return;
++	}
++
++	wil_info(wil, "FW watchdog every %u ms\n", fw_watchdog_ms);
++	mod_delayed_work(system_wq, &wil->fw_watchdog_work,
++			 msecs_to_jiffies(fw_watchdog_ms));
+ }
+ 
+ /*
+@@ -1687,6 +1780,8 @@ int wil_reset(struct wil6210_priv *wil,
+ 	WARN_ON(!mutex_is_locked(&wil->mutex));
+ 	WARN_ON(test_bit(wil_status_napi_en, wil->status));
+ 
++	cancel_delayed_work(&wil->fw_watchdog_work);
++
+ 	if (debug_fw) {
+ 		static const u8 mac[ETH_ALEN] = {
+ 			0x00, 0xde, 0xad, 0x12, 0x34, 0x56,
+@@ -1856,6 +1951,7 @@ int wil_reset(struct wil6210_priv *wil,
+ 		}
+ 
+ 		wil_fw_log_enable(wil, fw_log_level);
++		wil_fw_watchdog_start(wil);
+ 
+ 		wil->txrx_ops.configure_interrupt_moderation(wil);
+ 
+--- a/drivers/net/wireless/ath/wil6210/wil6210.h
++++ b/drivers/net/wireless/ath/wil6210/wil6210.h
+@@ -971,6 +971,8 @@ struct wil6210_priv {
+ 	struct work_struct wmi_event_worker;
+ 	struct workqueue_struct *wq_service;
+ 	struct work_struct fw_error_worker;	/* for FW error recovery */
++	struct delayed_work fw_watchdog_work;	/* catch silent FW restarts */
++	u8 fw_log_level;		/* armed FW trace level, 0 = off */
+ 	struct list_head pending_wmi_ev;
+ 	/*
+ 	 * protect pending_wmi_ev
+@@ -1444,6 +1446,7 @@ void update_supported_bands(struct wil62
+ 
+ void wil_clear_fw_log_addr(struct wil6210_priv *wil);
+ void wil_fw_log_enable(struct wil6210_priv *wil, u8 level);
++void wil_fw_watchdog_start(struct wil6210_priv *wil);
+ int wmi_set_cqm_rssi_config(struct wil6210_priv *wil,
+ 			    s32 rssi_thold, u32 rssi_hyst);
+ #endif /* __WIL6210_H__ */

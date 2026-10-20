@@ -1,0 +1,12 @@
+#!/bin/sh
+# SPDX-License-Identifier: ISC
+# The ipq40xx images declare compat_version 1.1 (config cannot be migrated from
+# swconfig to DSA). A fresh install is already DSA-native, but nothing ever
+# records that on the device, so sysupgrade keeps comparing 1.0 (the default
+# for a missing option) against 1.1 and refuses to keep the config forever.
+# Record it once, so later upgrades can carry the config over.
+[ -n "$(uci -q get system.@system[0].compat_version)" ] || {
+	uci -q set system.@system[0].compat_version='1.1'
+	uci -q commit system
+}
+exit 0

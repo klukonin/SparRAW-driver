@@ -1,0 +1,140 @@
+wil6210: AP SME in user space — report a new station after its response
+
+With disable_ap_sme (split MAC) hostapd 2.10+ adds the station
+(NL80211_CMD_NEW_STATION → WMI_NEW_STA) before it sends the
+(Re)Association Response.  Sparrow firmware 6.2 expects the response
+first: WMI_NEW_STA moves its MLME to ASSOCIATE, and the response that
+follows (WMI_SW_TX_REQ, EVT_CTRL_ASSOC_RESPONSE_RET) is unexpected there
+and fatal — every association crashed the firmware.  Keep the station
+added by hostapd and send WMI_NEW_STA right after a successful
+(Re)Association Response to that station has been transmitted; drop it
+on del_station.
+--- a/drivers/net/wireless/ath/wil6210/cfg80211.c
++++ b/drivers/net/wireless/ath/wil6210/cfg80211.c
+@@ -1526,6 +1526,65 @@ static int wil_cfg80211_set_wiphy_params
+ 	return 0;
+ }
+ 
++static int wil_splitmac_pend_new_sta(struct wil6210_vif *vif, const u8 *mac,
++				     u8 aid)
++{
++	int i, free = -1;
++
++	for (i = 0; i < WIL6210_PENDING_NEW_STA; i++) {
++		if (vif->pending_new_sta[i].valid &&
++		    ether_addr_equal(vif->pending_new_sta[i].addr, mac)) {
++			free = i;
++			break;
++		}
++		if (!vif->pending_new_sta[i].valid && free < 0)
++			free = i;
++	}
++	if (free < 0)	/* table full: old behaviour */
++		return wmi_new_sta(vif, mac, aid);
++	ether_addr_copy(vif->pending_new_sta[free].addr, mac);
++	vif->pending_new_sta[free].aid = aid;
++	vif->pending_new_sta[free].valid = true;
++	return 0;
++}
++
++static void wil_splitmac_drop_new_sta(struct wil6210_vif *vif, const u8 *mac)
++{
++	int i;
++
++	for (i = 0; i < WIL6210_PENDING_NEW_STA; i++)
++		if (vif->pending_new_sta[i].valid &&
++		    (!mac || ether_addr_equal(vif->pending_new_sta[i].addr, mac)))
++			vif->pending_new_sta[i].valid = false;
++}
++
++/* A (Re)Association Response left for the peer: a successful one completes
++ * the station that hostapd added before it
++ */
++static void wil_splitmac_assoc_resp_sent(struct wil6210_priv *wil,
++					 struct wil6210_vif *vif,
++					 const u8 *buf, size_t len)
++{
++	const struct ieee80211_mgmt *mgmt = (const void *)buf;
++	int i;
++
++	if (len < offsetofend(struct ieee80211_mgmt, u.assoc_resp.aid) ||
++	    !(ieee80211_is_assoc_resp(mgmt->frame_control) ||
++	      ieee80211_is_reassoc_resp(mgmt->frame_control)))
++		return;
++
++	for (i = 0; i < WIL6210_PENDING_NEW_STA; i++) {
++		if (!vif->pending_new_sta[i].valid ||
++		    !ether_addr_equal(vif->pending_new_sta[i].addr, mgmt->da))
++			continue;
++		vif->pending_new_sta[i].valid = false;
++		if (le16_to_cpu(mgmt->u.assoc_resp.status_code) ==
++		    WLAN_STATUS_SUCCESS)
++			wmi_new_sta(vif, mgmt->da, vif->pending_new_sta[i].aid);
++		break;
++	}
++}
++
+ int wil_cfg80211_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
+ 			 struct cfg80211_mgmt_tx_params *params,
+ 			 u64 *cookie)
+@@ -1578,6 +1637,10 @@ int wil_cfg80211_mgmt_tx(struct wiphy *w
+ 			     params->wait);
+ 
+ out:
++	if (disable_ap_sme && wdev->iftype == NL80211_IFTYPE_AP &&
++	    (rc == 0 || rc == -EAGAIN))
++		wil_splitmac_assoc_resp_sent(wil, vif, buf, len);
++
+ 	/* when the sent packet was not acked by receiver(ACK=0), rc will
+ 	 * be -EAGAIN. In this case this function needs to return success,
+ 	 * the ACK=0 will be reflected in tx_status.
+@@ -2352,7 +2415,13 @@ static int wil_cfg80211_add_station(stru
+ 		return -EINVAL;
+ 	}
+ 
+-	return wmi_new_sta(vif, mac, params->aid);
++	/* hostapd adds the station before it sends the (Re)Association
++	 * Response (hostapd 2.10+), while the firmware expects the response
++	 * first: WMI_NEW_STA would move its MLME to ASSOCIATE and the
++	 * response that follows is fatal there.  Keep the station and report
++	 * it right after the response (wil_splitmac_assoc_resp_sent).
++	 */
++	return wil_splitmac_pend_new_sta(vif, mac, params->aid);
+ }
+ 
+ static int wil_cfg80211_del_station(struct wiphy *wiphy,
+@@ -2365,6 +2434,8 @@ static int wil_cfg80211_del_station(stru
+ 	wil_dbg_misc(wil, "del_station: %pM, reason=%d mid=%d\n",
+ 		     params->mac, params->reason_code, vif->mid);
+ 
++	wil_splitmac_drop_new_sta(vif, params->mac);
++
+ 	mutex_lock(&wil->mutex);
+ 	wil6210_disconnect(vif, params->mac, params->reason_code);
+ 	mutex_unlock(&wil->mutex);
+--- a/drivers/net/wireless/ath/wil6210/wil6210.h
++++ b/drivers/net/wireless/ath/wil6210/wil6210.h
+@@ -80,6 +80,7 @@ static inline u32 WIL_GET_BITS(u32 x, in
+ #define WIL_RING_SIZE_ORDER_MIN	(5)
+ #define WIL_RING_SIZE_ORDER_MAX	(15)
+ #define WIL6210_MAX_TX_RINGS	(24) /* HW limit */
++#define WIL6210_PENDING_NEW_STA	(4)
+ #define WIL6210_MAX_CID		(20) /* max number of stations */
+ #define WIL6210_RX_DESC_MAX_CID	(8)  /* HW limit */
+ #define WIL_MAX_AMPDU_SIZE	(64 * 1024) /* FW/HW limit */
+@@ -876,6 +877,15 @@ struct wil6210_vif {
+ 	 * reported as a roam (IEEE 802.11-2020 11.3.5.4)
+ 	 */
+ 	bool reassoc_roam;
++	/* AP SME in user space (disable_ap_sme): stations added by hostapd,
++	 * reported to the firmware (WMI_NEW_STA) only once their
++	 * (Re)Association Response has been sent
++	 */
++	struct {
++		u8 addr[ETH_ALEN];
++		u8 aid;
++		bool valid;
++	} pending_new_sta[WIL6210_PENDING_NEW_STA];
+ 	struct timer_list connect_timer;
+ 	struct work_struct disconnect_worker;
+ 	/* scan */

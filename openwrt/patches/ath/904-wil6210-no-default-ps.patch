@@ -1,0 +1,29 @@
+wil6210: do not enable power save by default
+
+A DMG radio is used for point-to-point links where latency matters.
+With power save on the round-trip time over an otherwise idle link is
+170-370 ms instead of 0.8 ms.
+
+Userspace does try to turn it off (OpenWrt defaults the 'powersave'
+option to 0 and sends NL80211_CMD_SET_POWER_SAVE at interface setup),
+but that happens before the firmware is up and the result is ignored,
+so the interface ends up running with power save enabled anyway.
+
+--- a/drivers/net/wireless/ath/wil6210/cfg80211.c
++++ b/drivers/net/wireless/ath/wil6210/cfg80211.c
+@@ -2792,9 +2792,13 @@
+ 				 BIT(NL80211_IFTYPE_P2P_GO) |
+ 				 BIT(NL80211_IFTYPE_P2P_DEVICE) |
+ 				 BIT(NL80211_IFTYPE_MONITOR);
++	/* Power save is not wanted by default here: this is DMG gear, used for
++	 * point-to-point links where latency matters (it costs a few hundred
++	 * milliseconds of round-trip). Userspace still turns it on on request,
++	 * and OpenWrt's default for the 'powersave' option is off anyway.
++	 */
+ 	wiphy->flags |= WIPHY_FLAG_HAS_REMAIN_ON_CHANNEL |
+-			WIPHY_FLAG_AP_PROBE_RESP_OFFLOAD |
+-			WIPHY_FLAG_PS_ON_BY_DEFAULT;
++			WIPHY_FLAG_AP_PROBE_RESP_OFFLOAD;
+ 	if (!disable_ap_sme)
+ 		wiphy->flags |= WIPHY_FLAG_HAVE_AP_SME;
+ 	dev_dbg(wiphy_dev(wiphy), "%s : flags = 0x%08x\n",

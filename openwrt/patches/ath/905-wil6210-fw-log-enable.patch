@@ -1,0 +1,119 @@
+wil6210: let the host switch the firmware trace ring on
+
+The firmware allocates its own log ring and publishes the address in
+RGF_USER_USAGE_1 once it is up; the driver only ever clears that register.
+Logging itself stays off until the per-module level bytes in the ring header
+are filled in:
+
+	struct log_table_header {
+		u32 write_ptr;
+		u8  module_level_enable[16]; /* b0 err, b1 warn, b2 info, b3 verbose */
+		u32 evt[];
+	};
+
+Vendor images come up with those bytes zeroed, so the ring is allocated and
+never written to - exactly the wrong state when the firmware wedges with no
+assert code to go on (observed on a wAP 60G: the transmitting side stops
+answering WMI with no assert at all).
+
+Add a fw_log_level module parameter that stores the mask after FW is ready.
+0, the default, keeps the previous behaviour.
+--- a/drivers/net/wireless/ath/wil6210/main.c
++++ b/drivers/net/wireless/ath/wil6210/main.c
+@@ -33,6 +33,11 @@ bool no_fw_recovery;
+ module_param(no_fw_recovery, bool, 0644);
+ MODULE_PARM_DESC(no_fw_recovery, " disable automatic FW error recovery");
+ 
++static u8 fw_log_level;
++module_param(fw_log_level, byte, 0644);
++MODULE_PARM_DESC(fw_log_level,
++		 " FW trace level mask stored into the FW log ring header: bit0 error, bit1 warn, bit2 info, bit3 verbose. 0 (default) leaves FW logging off");
++
+ /* if not set via modparam, will be set to default value of 1/8 of
+  * rx ring size during init flow
+  */
+@@ -1601,6 +1606,65 @@ void wil_clear_fw_log_addr(struct wil621
+ }
+ 
+ /*
++ * Turn the FW trace ring on.
++ *
++ * The FW allocates the ring itself and publishes its address in
++ * RGF_USER_USAGE_1 once it is up, but logging stays off until the per-module
++ * level bytes in the ring header are filled in:
++ *
++ *	struct log_table_header {
++ *		u32 write_ptr;
++ *		u8  module_level_enable[16]; // b0 err, b1 warn, b2 info, b3 verbose
++ *		u32 evt[];
++ *	};
++ *
++ * Vendor images come up with those bytes zeroed, so the ring is allocated and
++ * never written to - which is exactly the wrong state when the FW wedges with
++ * no assert code to go on.
++ */
++void wil_fw_log_enable(struct wil6210_priv *wil)
++{
++	u32 addr = wil_r(wil, RGF_USER_USAGE_1);
++	void __iomem *dst = NULL;
++	u32 word;
++	int i;
++
++	if (!fw_log_level)
++		return;
++
++	if (!addr) {
++		wil_err(wil, "FW log address not published by FW\n");
++		return;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(fw_mapping); i++) {
++		struct fw_map *map = &fw_mapping[i];
++
++		if (!map->to || addr < map->from || addr >= map->to)
++			continue;
++		dst = (u8 __iomem *)wil->csr + HOSTADDR(map->host) +
++		      (addr - map->from);
++		break;
++	}
++
++	if (!dst) {
++		wil_err(wil, "FW log address 0x%08x outside FW mappings\n",
++			addr);
++		return;
++	}
++
++	/* one level byte per module, all set the same */
++	word = fw_log_level * 0x01010101u;
++	for (i = 0; i < 16; i += 4)
++		writel(word, (u8 __iomem *)dst + sizeof(u32) + i);
++	/* the levels must land before the FW next looks at them */
++	wmb();
++
++	wil_info(wil, "FW log enabled at 0x%08x, level mask 0x%02x\n",
++		 addr, fw_log_level);
++}
++
++/*
+  * We reset all the structures, and we reset the UMAC.
+  * After calling this routine, you're expected to reload
+  * the firmware.
+@@ -1785,6 +1849,8 @@ int wil_reset(struct wil6210_priv *wil,
+ 			return rc;
+ 		}
+ 
++		wil_fw_log_enable(wil);
++
+ 		wil->txrx_ops.configure_interrupt_moderation(wil);
+ 
+ 		/* Enable OFU rdy valid bug fix, to prevent hang in oful34_rx
+--- a/drivers/net/wireless/ath/wil6210/wil6210.h
++++ b/drivers/net/wireless/ath/wil6210/wil6210.h
+@@ -1443,6 +1443,7 @@ int wmi_addba_rx_resp_edma(struct wil621
+ void update_supported_bands(struct wil6210_priv *wil);
+ 
+ void wil_clear_fw_log_addr(struct wil6210_priv *wil);
++void wil_fw_log_enable(struct wil6210_priv *wil);
+ int wmi_set_cqm_rssi_config(struct wil6210_priv *wil,
+ 			    s32 rssi_thold, u32 rssi_hyst);
+ #endif /* __WIL6210_H__ */

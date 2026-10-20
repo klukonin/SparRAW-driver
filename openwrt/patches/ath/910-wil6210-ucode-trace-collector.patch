@@ -1,0 +1,314 @@
+wil6210: collect the ucode trace ring in the driver
+
+The ucode keeps its own trace ring, and it is tiny: 256 words, about a second
+and a half of history on a beaconing node. Draining it from userspace does not
+work - between two reads part of it is overwritten and the stream silently
+loses records, which is easy to mistake for the device skipping work.
+
+Poll it from the driver every uc_trace_ms instead, append only the words that
+are new since the last pass into a 1 MB buffer, and hand the whole thing out
+through debugfs uc_trace. Each batch carries a magic, the word count and a
+host timestamp, so userspace can reassemble a continuous, timestamped trace
+and see where (if anywhere) it lost data.
+
+0, the default, keeps the collector off.
+--- a/drivers/net/wireless/ath/wil6210/debugfs.c
++++ b/drivers/net/wireless/ath/wil6210/debugfs.c
+@@ -10,6 +10,7 @@
+ #include <linux/pci.h>
+ #include <linux/rtnetlink.h>
+ #include <linux/power_supply.h>
++#include <linux/vmalloc.h>
+ #include "wil6210.h"
+ #include "wmi.h"
+ #include "txrx.h"
+@@ -1539,6 +1540,49 @@ static ssize_t wil_write_file_recovery(s
+ 	return rc;
+ }
+ 
++/*---------ucode trace------------*/
++/* Слитый из кольца поток ucode-трассировки: отдаём одним куском, дальше
++ * разбирает userspace (pайки: magic, count, ktime, слова).
++ */
++static ssize_t wil_read_file_uc_trace(struct file *file, char __user *user_buf,
++				      size_t count, loff_t *ppos)
++{
++	struct wil6210_priv *wil = file->private_data;
++	size_t len, off;
++	void *tmp;
++	ssize_t rc;
++
++	if (!wil->uc_trace_buf)
++		return 0;
++
++	tmp = vmalloc(WIL_UC_TRACE_SIZE);
++	if (!tmp)
++		return -ENOMEM;
++
++	spin_lock_bh(&wil->uc_trace_lock);
++	if (wil->uc_trace_wrapped) {
++		/* самый старый байт идёт сразу за головой */
++		off = WIL_UC_TRACE_SIZE - wil->uc_trace_head;
++		memcpy(tmp, wil->uc_trace_buf + wil->uc_trace_head, off);
++		memcpy(tmp + off, wil->uc_trace_buf, wil->uc_trace_head);
++		len = WIL_UC_TRACE_SIZE;
++	} else {
++		memcpy(tmp, wil->uc_trace_buf, wil->uc_trace_head);
++		len = wil->uc_trace_head;
++	}
++	spin_unlock_bh(&wil->uc_trace_lock);
++
++	rc = simple_read_from_buffer(user_buf, count, ppos, tmp, len);
++	vfree(tmp);
++
++	return rc;
++}
++
++static const struct file_operations fops_uc_trace = {
++	.read  = wil_read_file_uc_trace,
++	.open  = simple_open,
++};
++
+ /*---------FW log level------------*/
+ /* Write the per-module level bytes into the FW log ring header right now,
+  * without resetting the device. Needed because the FW can restart on its own
+@@ -1561,6 +1605,10 @@ static ssize_t wil_write_file_fw_log_lev
+ 	 * point where the silent-restart watchdog can start without a reset
+ 	 */
+ 	wil_fw_watchdog_start(wil);
++	/* same for the trace collector: arming it must not need a device
++	 * reset, which is unsafe once the firmware is in trouble
++	 */
++	wil_uc_trace_start(wil);
+ 
+ 	return count;
+ }
+@@ -2372,6 +2420,7 @@ static const struct {
+ 	{"info",	0444,		&info_fops},
+ 	{"recovery", 0644,		&fops_recovery},
+ 	{"fw_log_level", 0200,		&fops_fw_log_level},
++	{"uc_trace",	0444,		&fops_uc_trace},
+ 	{"led_cfg",	0644,		&fops_led_cfg},
+ 	{"led_blink_time",	0644,	&fops_led_blink_time},
+ 	{"fw_capabilities",	0444,	&fw_capabilities_fops},
+--- a/drivers/net/wireless/ath/wil6210/main.c
++++ b/drivers/net/wireless/ath/wil6210/main.c
+@@ -8,6 +8,7 @@
+ #include <linux/if_arp.h>
+ #include <linux/etherdevice.h>
+ #include <linux/rtnetlink.h>
++#include <linux/vmalloc.h>
+ 
+ #include "wil6210.h"
+ #include "txrx.h"
+@@ -39,12 +40,18 @@ MODULE_PARM_DESC(fw_log_level,
+ 		 " FW trace level mask stored into the FW log ring header: bit0 error, bit1 warn, bit2 info, bit3 verbose. 0 (default) leaves FW logging off");
+ 
+ static void wil_fw_watchdog_work(struct work_struct *work);
++static void wil_uc_trace_work(struct work_struct *work);
+ 
+ static uint fw_watchdog_ms;
+ module_param(fw_watchdog_ms, uint, 0644);
+ MODULE_PARM_DESC(fw_watchdog_ms,
+ 		 " poll interval in ms for catching a silent FW restart and recovering from it; 0 (default) disables. Needs fw_log_level set - the log level bytes are the liveness marker");
+ 
++static uint uc_trace_ms;
++module_param(uc_trace_ms, uint, 0644);
++MODULE_PARM_DESC(uc_trace_ms,
++		 " poll interval in ms for draining the ucode trace ring into a big kernel buffer readable at debugfs uc_trace; 0 (default) disables");
++
+ /* if not set via modparam, will be set to default value of 1/8 of
+  * rx ring size during init flow
+  */
+@@ -743,6 +750,8 @@ int wil_priv_init(struct wil6210_priv *w
+ 	INIT_WORK(&wil->wmi_event_worker, wmi_event_worker);
+ 	INIT_WORK(&wil->fw_error_worker, wil_fw_error_worker);
+ 	INIT_DELAYED_WORK(&wil->fw_watchdog_work, wil_fw_watchdog_work);
++	INIT_DELAYED_WORK(&wil->uc_trace_work, wil_uc_trace_work);
++	spin_lock_init(&wil->uc_trace_lock);
+ 
+ 	INIT_LIST_HEAD(&wil->pending_wmi_ev);
+ 	spin_lock_init(&wil->wmi_ev_lock);
+@@ -860,6 +869,11 @@ void wil_priv_deinit(struct wil6210_priv
+ 	wil_dbg_misc(wil, "priv_deinit\n");
+ 
+ 	wil_set_recovery_state(wil, fw_recovery_idle);
++	cancel_delayed_work_sync(&wil->uc_trace_work);
++	vfree(wil->uc_trace_buf);
++	kfree(wil->uc_trace_tmp);
++	wil->uc_trace_buf = NULL;
++	wil->uc_trace_tmp = NULL;
+ 	cancel_delayed_work_sync(&wil->fw_watchdog_work);
+ 	cancel_work_sync(&wil->fw_error_worker);
+ 	wmi_event_flush(wil);
+@@ -1791,6 +1805,117 @@ static void wil_fw_watchdog_work(struct
+ 			      msecs_to_jiffies(fw_watchdog_ms));
+ }
+ 
++/*
++ * Непрерывный сбор трассировки ucode.
++ *
++ * Кольцо ucode крошечное: 256 слов, что на маячащем узле около полутора
++ * секунд истории. Вычерпывать его из userspace бесполезно - между двумя
++ * чтениями часть записей затирается, и поток рвётся (именно так мы приняли
++ * потерю выборки за пропуски маяков). Поэтому драйвер сам опрашивает кольцо
++ * каждые uc_trace_ms и дописывает НОВЫЕ слова в большой буфер, который
++ * читается одним куском из debugfs.
++ *
++ * Формат в буфере - последовательность пачек:
++ *     u32 magic = WIL_UC_TRACE_MAGIC
++ *     u32 count          - сколько слов в пачке
++ *     u64 ktime_ns       - момент чтения на хосте
++ *     u32 words[count]   - слова кольца в порядке записи
++ */
++static void wil_uc_trace_put(struct wil6210_priv *wil, const void *p, size_t n)
++{
++	size_t tail = WIL_UC_TRACE_SIZE - wil->uc_trace_head;
++
++	if (n > tail) {
++		memcpy(wil->uc_trace_buf + wil->uc_trace_head, p, tail);
++		memcpy(wil->uc_trace_buf, (const u8 *)p + tail, n - tail);
++		wil->uc_trace_head = n - tail;
++		wil->uc_trace_wrapped = true;
++	} else {
++		memcpy(wil->uc_trace_buf + wil->uc_trace_head, p, n);
++		wil->uc_trace_head += n;
++		if (wil->uc_trace_head == WIL_UC_TRACE_SIZE) {
++			wil->uc_trace_head = 0;
++			wil->uc_trace_wrapped = true;
++		}
++	}
++}
++
++static void wil_uc_trace_work(struct work_struct *work)
++{
++	struct wil6210_priv *wil = container_of(work, struct wil6210_priv,
++						uc_trace_work.work);
++	void __iomem *ring;
++	u32 hdr[4], wptr, n, i;
++	u32 *words = wil->uc_trace_tmp;	/* 1 КБ, на стек не влезает */
++
++	if (!uc_trace_ms || !wil->uc_trace_buf || !words)
++		return;
++
++	if (!test_bit(wil_status_fwready, wil->status) ||
++	    test_bit(wil_status_resetting, wil->status))
++		goto again;
++
++	ring = wil_log_ring(wil, RGF_USER_USAGE_2, false);
++	if (!ring)
++		goto again;
++
++	wptr = readl(ring);
++	if (wptr == wil->uc_trace_wptr)
++		goto again;
++
++	n = wptr - wil->uc_trace_wptr;
++	if (n > WIL_UC_RING_ENTRIES) {	/* не успели, часть затёрта */
++		wil->uc_trace_lost += n - WIL_UC_RING_ENTRIES;
++		n = WIL_UC_RING_ENTRIES;
++	}
++	for (i = 0; i < n; i++)
++		words[i] = readl((u8 __iomem *)ring + 0x14 +
++				 ((wptr - n + i) % WIL_UC_RING_ENTRIES) * 4);
++
++	hdr[0] = WIL_UC_TRACE_MAGIC;
++	hdr[1] = n;
++	*(u64 *)&hdr[2] = ktime_get_ns();
++
++	spin_lock_bh(&wil->uc_trace_lock);
++	wil_uc_trace_put(wil, hdr, sizeof(hdr));
++	wil_uc_trace_put(wil, words, n * sizeof(u32));
++	spin_unlock_bh(&wil->uc_trace_lock);
++	wil->uc_trace_wptr = wptr;
++
++again:
++	if (uc_trace_ms)
++		schedule_delayed_work(&wil->uc_trace_work,
++				      msecs_to_jiffies(uc_trace_ms));
++}
++
++void wil_uc_trace_start(struct wil6210_priv *wil)
++{
++	if (!uc_trace_ms)
++		return;
++
++	if (!wil->uc_trace_buf) {
++		wil->uc_trace_buf = vzalloc(WIL_UC_TRACE_SIZE);
++		wil->uc_trace_tmp = kcalloc(WIL_UC_RING_ENTRIES, sizeof(u32),
++					    GFP_KERNEL);
++		if (!wil->uc_trace_buf || !wil->uc_trace_tmp) {
++			wil_err(wil, "no memory for the ucode trace buffer\n");
++			vfree(wil->uc_trace_buf);
++			kfree(wil->uc_trace_tmp);
++			wil->uc_trace_buf = NULL;
++			wil->uc_trace_tmp = NULL;
++			return;
++		}
++	}
++	wil->uc_trace_head = 0;
++	wil->uc_trace_wrapped = false;
++	wil->uc_trace_lost = 0;
++	wil->uc_trace_wptr = 0;
++	wil_info(wil, "ucode trace collector every %u ms, buffer %u KB\n",
++		 uc_trace_ms, WIL_UC_TRACE_SIZE / 1024);
++	mod_delayed_work(system_wq, &wil->uc_trace_work,
++			 msecs_to_jiffies(uc_trace_ms));
++}
++
+ void wil_fw_watchdog_start(struct wil6210_priv *wil)
+ {
+ 	if (!fw_watchdog_ms)
+@@ -1825,6 +1950,7 @@ int wil_reset(struct wil6210_priv *wil,
+ 	WARN_ON(test_bit(wil_status_napi_en, wil->status));
+ 
+ 	cancel_delayed_work(&wil->fw_watchdog_work);
++	cancel_delayed_work(&wil->uc_trace_work);
+ 
+ 	if (debug_fw) {
+ 		static const u8 mac[ETH_ALEN] = {
+@@ -1997,6 +2123,7 @@ int wil_reset(struct wil6210_priv *wil,
+ 
+ 		wil_fw_log_enable(wil, fw_log_level);
+ 		wil_fw_watchdog_start(wil);
++		wil_uc_trace_start(wil);
+ 
+ 		wil->txrx_ops.configure_interrupt_moderation(wil);
+ 
+--- a/drivers/net/wireless/ath/wil6210/wil6210.h
++++ b/drivers/net/wireless/ath/wil6210/wil6210.h
+@@ -137,6 +137,11 @@ static inline u32 wil_mtu2macbuf(u32 mtu
+ #define WIL6210_FW_RECOVERY_TO	msecs_to_jiffies(5000)
+ #define WIL6210_SCAN_TO		msecs_to_jiffies(10000)
+ #define WIL6210_DISCONNECT_TO_MS (2000)
++/* ucode trace ring: 256 слов, поэтому собираем его в буфер побольше */
++#define WIL_UC_RING_ENTRIES	256
++#define WIL_UC_TRACE_SIZE	(1024 * 1024)
++#define WIL_UC_TRACE_MAGIC	0x474c4355	/* "UCLG" */
++
+ #define WIL6210_RX_HIGH_TRSH_INIT		(0)
+ #define WIL6210_RX_HIGH_TRSH_DEFAULT \
+ 				(1 << (WIL_RX_RING_SIZE_ORDER_DEFAULT - 3))
+@@ -973,6 +978,14 @@ struct wil6210_priv {
+ 	struct work_struct fw_error_worker;	/* for FW error recovery */
+ 	struct delayed_work fw_watchdog_work;	/* catch silent FW restarts */
+ 	u8 fw_log_level;		/* armed FW trace level, 0 = off */
++	struct delayed_work uc_trace_work;	/* drain the ucode trace ring */
++	void *uc_trace_buf;
++	u32 *uc_trace_tmp;
++	size_t uc_trace_head;
++	bool uc_trace_wrapped;
++	u32 uc_trace_wptr;
++	u32 uc_trace_lost;
++	spinlock_t uc_trace_lock;
+ 	struct list_head pending_wmi_ev;
+ 	/*
+ 	 * protect pending_wmi_ev
+@@ -1447,6 +1460,7 @@ void update_supported_bands(struct wil62
+ void wil_clear_fw_log_addr(struct wil6210_priv *wil);
+ void wil_fw_log_enable(struct wil6210_priv *wil, u8 level);
+ void wil_fw_watchdog_start(struct wil6210_priv *wil);
++void wil_uc_trace_start(struct wil6210_priv *wil);
+ int wmi_set_cqm_rssi_config(struct wil6210_priv *wil,
+ 			    s32 rssi_thold, u32 rssi_hyst);
+ #endif /* __WIL6210_H__ */

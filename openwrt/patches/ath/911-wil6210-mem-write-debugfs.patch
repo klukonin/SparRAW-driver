@@ -1,0 +1,75 @@
+--- a/drivers/net/wireless/ath/wil6210/debugfs.c
++++ b/drivers/net/wireless/ath/wil6210/debugfs.c
+@@ -612,6 +612,64 @@ static int memread_show(struct seq_file
+ }
+ DEFINE_SHOW_ATTRIBUTE(memread);
+ 
++/* Запись 32-битного слова в память устройства: echo "0xАДРЕС 0xЗНАЧЕНИЕ" > mem_write
++ *
++ * Нужна для опытов над ОЗУ ucode. Таблицы диспетчеризации и управляющие
++ * переменные ucode (например bcon_kind по 0x801438 -> host 0x941438) строятся
++ * в рантайме, в прошивочном образе их нет, а штатный mem_val доступен только
++ * на чтение. Адрес - в адресах хоста, как у mem_addr.
++ */
++static ssize_t wil_write_file_memwrite(struct file *file,
++				       const char __user *buf,
++				       size_t len, loff_t *ppos)
++{
++	struct wil6210_priv *wil = file->private_data;
++	char kbuf[32];
++	unsigned int addr, val;
++	void __iomem *a;
++	int rc;
++
++	if (len == 0 || len >= sizeof(kbuf))
++		return -EINVAL;
++	if (copy_from_user(kbuf, buf, len))
++		return -EFAULT;
++	kbuf[len] = '\0';
++
++	if (sscanf(kbuf, "%i %i", &addr, &val) != 2)
++		return -EINVAL;
++
++	rc = wil_pm_runtime_get(wil);
++	if (rc < 0)
++		return rc;
++
++	rc = wil_mem_access_lock(wil);
++	if (rc) {
++		wil_pm_runtime_put(wil);
++		return rc;
++	}
++
++	a = wmi_buffer(wil, cpu_to_le32(addr));
++	if (a) {
++		writel(val, a);
++		wmb(); /* слово должно уйти в устройство до снятия блокировки */
++		wil_info(wil, "mem_write: [0x%08x] = 0x%08x\n", addr, val);
++	} else {
++		wil_err(wil, "mem_write: адрес 0x%08x вне окна\n", addr);
++		rc = -EINVAL;
++	}
++
++	wil_mem_access_unlock(wil);
++	wil_pm_runtime_put(wil);
++
++	return rc ? rc : len;
++}
++
++static const struct file_operations fops_memwrite = {
++	.open		= simple_open,
++	.write		= wil_write_file_memwrite,
++	.llseek		= default_llseek,
++};
++
+ static ssize_t wil_read_file_ioblob(struct file *file, char __user *user_buf,
+ 				    size_t count, loff_t *ppos)
+ {
+@@ -2408,6 +2466,7 @@ static const struct {
+ 	{"desc",	0444,		&txdesc_fops},
+ 	{"bf",		0444,		&bf_fops},
+ 	{"mem_val",	0644,		&memread_fops},
++	{"mem_write",	0244,		&fops_memwrite},
+ 	{"rxon",	0244,		&fops_rxon},
+ 	{"tx_mgmt",	0244,		&fops_txmgmt},
+ 	{"wmi_send", 0244,		&fops_wmi},
