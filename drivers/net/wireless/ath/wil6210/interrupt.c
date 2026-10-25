@@ -515,10 +515,31 @@ static void wil_cache_mbox_regs(struct wil6210_priv *wil)
 	wil_mbox_ring_le2cpus(&wil->mbox_ctl.tx);
 }
 
+static bool wil_validate_mbox_ring(struct wil6210_priv *wil,
+				   struct wil6210_mbox_ring *r, const char *name)
+{
+	size_t d = sizeof(struct wil6210_mbox_ring_desc);
+
+	/* ring descriptors are read from base..base+size; size also divides
+	 * the tail arithmetic
+	 */
+	if (r->size < d || r->size % d || !wmi_addr(wil, r->base) ||
+	    !wmi_addr(wil, r->base + r->size - sizeof(u32))) {
+		wil_err(wil, "%s mbox ring invalid: base 0x%08x size %d\n",
+			name, r->base, r->size);
+		return false;
+	}
+	return true;
+}
+
 static bool wil_validate_mbox_regs(struct wil6210_priv *wil)
 {
 	size_t min_size = sizeof(struct wil6210_mbox_hdr) +
 		sizeof(struct wmi_cmd_hdr);
+
+	if (!wil_validate_mbox_ring(wil, &wil->mbox_ctl.rx, "rx") ||
+	    !wil_validate_mbox_ring(wil, &wil->mbox_ctl.tx, "tx"))
+		return false;
 
 	if (wil->mbox_ctl.rx.entry_size < min_size) {
 		wil_err(wil, "rx mbox entry too small (%d)\n",

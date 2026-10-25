@@ -54,7 +54,8 @@ void wil_pmc_alloc(struct wil6210_priv *wil,
 		wil_err(wil, "ERROR pmc is already allocated\n");
 		goto no_release_err;
 	}
-	if ((num_descriptors <= 0) || (descriptor_size <= 0)) {
+	if ((num_descriptors <= 0) || (descriptor_size <= 0) ||
+	    descriptor_size > U16_MAX) {	/* d->dma.length is 16 bit */
 		wil_err(wil,
 			"Invalid params num_descriptors(%d), descriptor_size(%d)\n",
 			num_descriptors, descriptor_size);

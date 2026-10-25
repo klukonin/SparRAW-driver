@@ -91,7 +91,24 @@ static inline u32 WIL_GET_BITS(u32 x, int b0, int b1)
 #define WIL_WMI_CALL_GENERAL_TO_MS 100
 #define WIL_EXTENDED_MCS_26 (26) /* FW reports MCS 12.1 to driver as "26" */
 #define WIL_BASE_MCS_FOR_EXTENDED_26 (7) /* MCS 7 is base MCS for MCS 12.1 */
-#define WIL_EXTENDED_MCS_CHECK(x) (((x) == WIL_EXTENDED_MCS_26) ? "12.1" : #x)
+/* MCS for log/debugfs text; the former macro stringified the argument
+ * expression ("bf_mcs") instead of printing its value
+ */
+static inline const char *wil_mcs_str(unsigned int mcs)
+{
+	static const char *const s[] = {
+		"0", "1", "2", "3", "4", "5", "6", "7",
+		"8", "9", "10", "11", "12", "13", "14", "15",
+		"16", "17", "18", "19", "20", "21", "22", "23",
+		"24", "25", "26", "27", "28", "29", "30", "31"
+	};
+
+	if (mcs == WIL_EXTENDED_MCS_26)
+		return "12.1";
+	return mcs < ARRAY_SIZE(s) ? s[mcs] : "?";
+}
+
+#define WIL_EXTENDED_MCS_CHECK(x) wil_mcs_str(x)
 
 /* Hardware offload block adds the following:
  * 26 bytes - 3-address QoS data header
@@ -492,6 +509,7 @@ struct wil6210_mbox_hdr {
 
 struct pending_wmi_event {
 	struct list_head list;
+	u32 reply_seq; /* != 0: the event a handler-wait wmi_call() waits for */
 	struct {
 		struct wil6210_mbox_hdr hdr;
 		struct wmi_cmd_hdr wmi;
@@ -722,6 +740,7 @@ struct wil_p2p_info {
 	unsigned int listen_duration;
 	struct timer_list discovery_timer; /* listen/search duration */
 	struct work_struct discovery_expired_work; /* listen/search expire */
+	bool is_search; /* the running discovery is a search, not a listen */
 	struct work_struct delayed_listen_work; /* listen after scan done */
 };
 
@@ -750,6 +769,8 @@ struct wil_sta_info {
 	u8 mid;
 	enum wil_sta_status status;
 	struct wil_net_stats stats;
+	time64_t connected_at;		/* boottime seconds, for station info */
+	unsigned long last_active;	/* jiffies of the last RX/TX data frame */
 	/*
 	 * 20 latency bins. 1st bin counts packets with latency
 	 * of 0..tx_latency_res, last bin counts packets with latency
@@ -910,6 +931,7 @@ struct wil6210_vif {
 	 * the connection is up (lm_cfg_worker).
 	 */
 	u8 max_lost_beacons;
+	u16 bss_bi; /* STA: beacon interval of the BSS joined, TU */
 	u8 lm_cfg_cid;
 	struct work_struct lm_cfg_worker;
 };
@@ -1000,12 +1022,25 @@ struct wil6210_priv {
 	u8 reply_mid;
 	void *reply_buf;
 	u16 reply_size;
+	/* reply is the WMI_DISCONNECT_EVENTID of this peer only */
+	u8 reply_bssid[ETH_ALEN];
+	bool reply_bssid_valid;
+	/* wmi_call() without reply buffer: once the event is received the
+	 * caller drops wmi_mutex and waits until handled_seq reaches its
+	 * reply_wait_seq, i.e. the event's handler has run on wmi_wq
+	 */
+	u32 reply_seq;		/* last handler-wait number given out */
+	u32 reply_wait_seq;	/* that of the call holding wmi_mutex, 0 - none */
+	u32 handled_seq;	/* handlers done up to this number */
+	bool reply_tagged;	/* the awaited event was tagged reply_wait_seq */
+	wait_queue_head_t wmi_handled_wq;
 	struct workqueue_struct *wmi_wq; /* for deferred calls */
 	struct work_struct wmi_event_worker;
 	struct workqueue_struct *wq_service;
 	struct work_struct fw_error_worker;	/* for FW error recovery */
 	struct delayed_work fw_watchdog_work;	/* catch silent FW restarts */
 	u8 fw_log_level;		/* armed FW trace level, 0 = off */
+	u8 fw_log_req;			/* level set via debugfs, 0 = module param */
 	struct delayed_work uc_trace_work;	/* drain the ucode trace ring */
 	void *uc_trace_buf;
 	u32 *uc_trace_tmp;
@@ -1043,7 +1078,18 @@ struct wil6210_priv {
 	bool use_enhanced_dma_hw;
 	struct wil_txrx_ops txrx_ops;
 
+	u64 mgmt_tx_cookie; /* last cookie of wil_cfg80211_mgmt_tx() */
 	struct mutex mutex; /* for wil6210_priv access in wil_{up|down} */
+	struct {
+		struct mutex lock; /* req/wdev/session_id/reported */
+		struct cfg80211_pmsr_request *req; /* текущая сессия FTM */
+		struct wireless_dev *wdev;
+		u32 session_id;
+		bool reported; /* итог (final) по адресату уже отдан */
+		/* сессия без WMI_TOF_SESSION_END не держит req вечно */
+		struct delayed_work timeout_work;
+		unsigned long deadline; /* jiffies */
+	} ftm;
 	/* for synchronizing device memory access while reset or suspend */
 	struct rw_semaphore mem_lock;
 	/* statistics */
@@ -1272,6 +1318,24 @@ int __wil_down(struct wil6210_priv *wil);
 void wil_refresh_fw_capabilities(struct wil6210_priv *wil);
 void wil_mbox_ring_le2cpus(struct wil6210_mbox_ring *r);
 int wil_find_cid(struct wil6210_priv *wil, u8 mid, const u8 *mac);
+
+/* ftm.c */
+extern const struct cfg80211_pmsr_capabilities wil_pmsr_capa;
+void wil_ftm_init(struct wil6210_priv *wil);
+void wil_ftm_reset(struct wil6210_priv *wil);
+void wil_ftm_fw_ready(struct wil6210_priv *wil);
+int wil_ftm_start(struct wiphy *wiphy, struct wireless_dev *wdev,
+		  struct cfg80211_pmsr_request *req);
+void wil_ftm_abort(struct wiphy *wiphy, struct wireless_dev *wdev,
+		   struct cfg80211_pmsr_request *req);
+struct wmi_tof_ftm_per_dest_res_event;
+struct wmi_tof_session_end_event;
+void wil_ftm_evt_per_dest_res(struct wil6210_vif *vif,
+			      const struct wmi_tof_ftm_per_dest_res_event *evt,
+			      int len);
+void wil_ftm_evt_session_end(struct wil6210_vif *vif,
+			     const struct wmi_tof_session_end_event *evt,
+			     int len);
 int wil_find_cid_by_idx(struct wil6210_priv *wil, u8 mid, int idx);
 void wil_set_ethtoolops(struct net_device *ndev);
 
@@ -1279,6 +1343,16 @@ struct fw_map *wil_find_fw_mapping(const char *section);
 void __iomem *wmi_buffer_block(struct wil6210_priv *wil, __le32 ptr, u32 size);
 void __iomem *wmi_buffer(struct wil6210_priv *wil, __le32 ptr);
 void __iomem *wmi_addr(struct wil6210_priv *wil, u32 ptr);
+/* Ring tail pointer reported by the firmware: the driver writes to it
+ * (wil_w), so it must be a valid address inside the BAR.
+ */
+static inline int wil_hwtail_check(struct wil6210_priv *wil, u32 tail)
+{
+	if (wmi_addr(wil, tail))
+		return 0;
+	wil_err(wil, "invalid ring tail pointer 0x%08x from FW\n", tail);
+	return -EINVAL;
+}
 int wmi_read_hdr(struct wil6210_priv *wil, __le32 ptr,
 		 struct wil6210_mbox_hdr *hdr);
 int wmi_send(struct wil6210_priv *wil, u16 cmdid, u8 mid, void *buf, u16 len);
@@ -1348,8 +1422,25 @@ int wil_p2p_listen(struct wil6210_priv *wil, struct wireless_dev *wdev,
 		   u64 *cookie);
 u8 wil_p2p_stop_discovery(struct wil6210_vif *vif);
 int wil_p2p_cancel_listen(struct wil6210_vif *vif, u64 cookie);
-void wil_p2p_listen_expired(struct work_struct *work);
-void wil_p2p_search_expired(struct work_struct *work);
+void wil_p2p_discovery_expired(struct work_struct *work);
+
+/* vif->bss holds a reference from connect until the connect event hands it
+ * to cfg80211 (cfg80211_connect_bss/cfg80211_roamed consume it)
+ */
+static inline void wil_vif_bss_put(struct wil6210_vif *vif)
+{
+	struct cfg80211_bss *bss = xchg(&vif->bss, NULL);
+
+	if (bss)
+		cfg80211_put_bss(wil_to_wiphy(vif_to_wil(vif)), bss);
+}
+
+static inline void wil_vif_bss_set(struct wil6210_vif *vif,
+				   struct cfg80211_bss *bss)
+{
+	wil_vif_bss_put(vif);
+	vif->bss = bss;
+}
 void wil_p2p_stop_radio_operations(struct wil6210_priv *wil);
 void wil_p2p_delayed_listen_work(struct work_struct *work);
 
@@ -1384,6 +1475,7 @@ void wil_cfg80211_deinit(struct wil6210_priv *wil);
 void wil_p2p_wdev_free(struct wil6210_priv *wil);
 
 int wmi_set_mac_address(struct wil6210_priv *wil, const void *addr);
+int wmi_set_ibss_bssid(struct wil6210_vif *vif, const u8 *bssid);
 int wmi_pcp_start(struct wil6210_vif *vif, int bi, u8 wmi_nettype, u8 chan,
 		  u8 edmg_chan, u8 hidden_ssid, u8 is_go);
 int wmi_pcp_stop(struct wil6210_vif *vif);

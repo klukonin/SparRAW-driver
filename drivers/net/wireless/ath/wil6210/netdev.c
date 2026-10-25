@@ -215,6 +215,7 @@ void wil_vif_free(struct wil6210_vif *vif)
 {
 	struct net_device *ndev = vif_to_ndev(vif);
 
+	wil_vif_bss_put(vif);
 	wil_vif_deinit(vif);
 	free_netdev(ndev);
 }
@@ -275,7 +276,7 @@ static void wil_vif_init(struct wil6210_vif *vif)
 
 	INIT_WORK(&vif->probe_client_worker, wil_probe_client_worker);
 	INIT_WORK(&vif->disconnect_worker, wil_disconnect_worker);
-	INIT_WORK(&vif->p2p.discovery_expired_work, wil_p2p_listen_expired);
+	INIT_WORK(&vif->p2p.discovery_expired_work, wil_p2p_discovery_expired);
 	INIT_WORK(&vif->p2p.delayed_listen_work, wil_p2p_delayed_listen_work);
 	INIT_WORK(&vif->enable_tx_key_worker, wil_enable_tx_key_worker);
 	INIT_WORK(&vif->lm_cfg_worker, wil_lm_cfg_worker);

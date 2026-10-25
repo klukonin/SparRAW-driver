@@ -93,6 +93,9 @@ static int wil_tx_cb_mode_to_n_bonded(u8 cb_mode)
 static void
 wil_memdup_ie(u8 **pdst, size_t *pdst_len, const u8 *src, size_t src_len)
 {
+	/* AP recovery passes the stored copy itself as the source */
+	if (src == *pdst && src_len == *pdst_len)
+		return;
 	kfree(*pdst);
 	*pdst = NULL;
 	*pdst_len = 0;
@@ -278,6 +281,21 @@ wil_mgmt_stypes[NUM_NL80211_IFTYPES] = {
 		.rx = BIT(IEEE80211_STYPE_ACTION >> 4) |
 		BIT(IEEE80211_STYPE_PROBE_REQ >> 4)
 	},
+	[NL80211_IFTYPE_ADHOC] = {
+		.tx = BIT(IEEE80211_STYPE_ACTION >> 4) |
+		BIT(IEEE80211_STYPE_PROBE_RESP >> 4) |
+		BIT(IEEE80211_STYPE_ASSOC_RESP >> 4) |
+		BIT(IEEE80211_STYPE_DISASSOC >> 4) |
+		BIT(IEEE80211_STYPE_AUTH >> 4) |
+		BIT(IEEE80211_STYPE_REASSOC_RESP >> 4),
+		.rx = BIT(IEEE80211_STYPE_ACTION >> 4) |
+		BIT(IEEE80211_STYPE_PROBE_REQ >> 4) |
+		BIT(IEEE80211_STYPE_ASSOC_REQ >> 4) |
+		BIT(IEEE80211_STYPE_DISASSOC >> 4) |
+		BIT(IEEE80211_STYPE_AUTH >> 4) |
+		BIT(IEEE80211_STYPE_DEAUTH >> 4) |
+		BIT(IEEE80211_STYPE_REASSOC_REQ >> 4)
+	},
 	[NL80211_IFTYPE_AP] = {
 		.tx = BIT(IEEE80211_STYPE_ACTION >> 4) |
 		BIT(IEEE80211_STYPE_PROBE_RESP >> 4) |
@@ -428,6 +446,70 @@ int wil_wmi2spec_ch(u8 wmi_ch, u8 *spec_ch)
 	return 0;
 }
 
+/* Station state for `iw station dump` / `iw link`, as mac80211 drivers
+ * report it.  802.11 state of a DMG station (IEEE 802.11-2020 11.3.1): it
+ * does not perform Open System authentication (12.3.3.1), so it is
+ * associated but not authenticated; authorized once its 802.1X controlled
+ * port (data port) is open.  QoS is mandatory in a DMG BSS (WME).  DMG
+ * beacons carry no TIM, so there is no DTIM period.
+ */
+static void wil_cid_fill_sinfo_state(struct wil6210_vif *vif, int cid,
+				     struct station_info *sinfo,
+				     const struct wmi_notify_req_done_event *evt)
+{
+	struct wil6210_priv *wil = vif_to_wil(vif);
+	struct wil_sta_info *sta = &wil->sta[cid];
+	struct wireless_dev *wdev = vif_to_wdev(vif);
+	bool authorized = false;
+	u16 bi;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(wil->ring2cid_tid); i++)
+		if (wil->ring2cid_tid[i][0] == cid &&
+		    wil->ring_tx_data[i].enabled &&
+		    wil->ring_tx_data[i].dot1x_open)
+			authorized = true;
+
+	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_STA_FLAGS);
+	sinfo->sta_flags.mask = BIT(NL80211_STA_FLAG_AUTHORIZED) |
+				BIT(NL80211_STA_FLAG_AUTHENTICATED) |
+				BIT(NL80211_STA_FLAG_ASSOCIATED) |
+				BIT(NL80211_STA_FLAG_WME);
+	sinfo->sta_flags.set = BIT(NL80211_STA_FLAG_WME);
+	if (sta->status == wil_sta_connected)
+		sinfo->sta_flags.set |= BIT(NL80211_STA_FLAG_ASSOCIATED);
+	if (authorized)
+		sinfo->sta_flags.set |= BIT(NL80211_STA_FLAG_AUTHORIZED);
+
+	if (sta->status == wil_sta_connected) {
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_CONNECTED_TIME) |
+				 BIT_ULL(NL80211_STA_INFO_INACTIVE_TIME);
+		sinfo->connected_time = ktime_get_boottime_seconds() -
+					sta->connected_at;
+		sinfo->inactive_time =
+			jiffies_to_msecs(jiffies - sta->last_active);
+	}
+
+	/* AP/PCP/IBSS: our own beacon interval; station: that of the BSS
+	 * joined (dump/get_station run under the wiphy lock)
+	 */
+	bi = vif->bi;
+	if (wdev->iftype == NL80211_IFTYPE_STATION ||
+	    wdev->iftype == NL80211_IFTYPE_P2P_CLIENT)
+		bi = vif->bss_bi;
+	if (bi) {
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_BSS_PARAM);
+		sinfo->bss_param.beacon_interval = bi;
+		sinfo->bss_param.dtim_period = 0;
+	}
+
+	/* FW link estimate, Mbit/s -> kbit/s */
+	if (le32_to_cpu(evt->tx_tpt)) {
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_EXPECTED_THROUGHPUT);
+		sinfo->expected_throughput = le32_to_cpu(evt->tx_tpt) * 1000;
+	}
+}
+
 int wil_cid_fill_sinfo(struct wil6210_vif *vif, int cid,
 		       struct station_info *sinfo)
 {
@@ -529,6 +611,8 @@ int wil_cid_fill_sinfo(struct wil6210_vif *vif, int cid,
 		else
 			sinfo->signal = reply.evt.sqi;
 	}
+
+	wil_cid_fill_sinfo_state(vif, cid, sinfo, &reply.evt);
 
 	return rc;
 }
@@ -841,25 +925,9 @@ static int wil_cfg80211_change_iface(struct wiphy *wiphy,
 		}
 	}
 
-	/* do not reset FW when there are active VIFs,
-	 * because it can cause significant disruption
-	 */
-	if (!wil_has_other_active_ifaces(wil, ndev, true, false) &&
-	    netif_running(ndev) && !wil_is_recovery_blocked(wil) &&
-	    !wil_is_safe_switch(wdev->iftype, type)) {
-		wil_dbg_misc(wil, "interface is up. resetting...\n");
-		mutex_lock(&wil->mutex);
-		__wil_down(wil);
-		rc = __wil_up(wil);
-		mutex_unlock(&wil->mutex);
-
-		if (rc)
-			return rc;
-		fw_reset = true;
-	}
-
 	switch (type) {
 	case NL80211_IFTYPE_STATION:
+	case NL80211_IFTYPE_ADHOC:
 	case NL80211_IFTYPE_AP:
 	case NL80211_IFTYPE_P2P_CLIENT:
 	case NL80211_IFTYPE_P2P_GO:
@@ -870,6 +938,37 @@ static int wil_cfg80211_change_iface(struct wiphy *wiphy,
 		break;
 	default:
 		return -EOPNOTSUPP;
+	}
+	/* WMI_PORT_ALLOCATE has no monitor port: refuse before the port of
+	 * the VIF is deleted
+	 */
+	if (type == NL80211_IFTYPE_MONITOR && vif->mid != 0 &&
+	    wil_has_active_ifaces(wil, true, false))
+		return -EOPNOTSUPP;
+
+	/* do not reset FW when there are active VIFs,
+	 * because it can cause significant disruption
+	 */
+	if (!wil_has_other_active_ifaces(wil, ndev, true, false) &&
+	    netif_running(ndev) && !wil_is_recovery_blocked(wil) &&
+	    !wil_is_safe_switch(wdev->iftype, type)) {
+		enum nl80211_iftype old = wdev->iftype;
+
+		wil_dbg_misc(wil, "interface is up. resetting...\n");
+		mutex_lock(&wil->mutex);
+		/* down with the old type, up with the new one: __wil_up()
+		 * sets the netdev type and the RX chain (sniffer) from it
+		 */
+		__wil_down(wil);
+		wdev->iftype = type;
+		rc = __wil_up(wil);
+		if (rc)
+			wdev->iftype = old;
+		mutex_unlock(&wil->mutex);
+
+		if (rc)
+			return rc;
+		fw_reset = true;
 	}
 
 	if (vif->mid != 0 && wil_has_active_ifaces(wil, true, false)) {
@@ -1160,6 +1259,10 @@ static int wil_ft_connect(struct wiphy *wiphy,
 		return -EOPNOTSUPP;
 	}
 
+	/* both are optional in nl80211 and dereferenced below */
+	if (!sme->bssid || !sme->channel)
+		return -EINVAL;
+
 	if (!sme->prev_bssid) {
 		wil_err(wil, "FT: prev_bssid was not set\n");
 		return -EINVAL;
@@ -1246,6 +1349,7 @@ static int wil_cfg80211_connect(struct wiphy *wiphy,
 	bool is_ft_roam = false;
 	bool reassoc = false;
 	u8 network_type;
+	u8 edmg_channel = 0;
 	enum ieee80211_bss_type bss_type = IEEE80211_BSS_TYPE_ESS;
 
 	wil_dbg_misc(wil, "connect, mid=%d\n", vif->mid);
@@ -1346,8 +1450,10 @@ static int wil_cfg80211_connect(struct wiphy *wiphy,
 			goto out;
 		}
 		rc = wil_ft_connect(wiphy, ndev, sme);
-		if (rc == 0)
-			vif->bss = bss;
+		if (rc == 0) {
+			wil_vif_bss_set(vif, bss);	/* keeps the reference */
+			bss = NULL;
+		}
 		goto out;
 	}
 
@@ -1366,6 +1472,11 @@ static int wil_cfg80211_connect(struct wiphy *wiphy,
 			goto out;
 		}
 	}
+
+	rc = wil_get_wmi_edmg_channel(wil, sme->edmg.bw_config,
+				      sme->edmg.channels, &edmg_channel);
+	if (rc < 0)
+		goto out;
 
 	/* leave the current AP only now, after every check that may fail */
 	if (reassoc) {
@@ -1398,10 +1509,7 @@ static int wil_cfg80211_connect(struct wiphy *wiphy,
 	memcpy(conn.ssid, ssid_eid+2, conn.ssid_len);
 	conn.channel = ch - 1;
 
-	rc = wil_get_wmi_edmg_channel(wil, sme->edmg.bw_config,
-				      sme->edmg.channels, &conn.edmg_channel);
-	if (rc < 0)
-		return rc;
+	conn.edmg_channel = edmg_channel;
 
 	ether_addr_copy(conn.bssid, bss->bssid);
 	ether_addr_copy(conn.dst_mac, bss->bssid);
@@ -1419,6 +1527,11 @@ static int wil_cfg80211_connect(struct wiphy *wiphy,
 		const u8 *op = ieee80211_bss_get_ie(bss, WLAN_EID_DMG_OPERATION);
 
 		vif->max_lost_beacons = (op && op[1] >= 10) ? op[2 + 9] : 0;
+		/* dot11MaxLostBeacons is 1..32 (MIB); outside it keep the
+		 * FW default instead of following a bogus value
+		 */
+		if (vif->max_lost_beacons > 32)
+			vif->max_lost_beacons = 0;
 		wil_info(wil, "BSS MaxLostBeacons %u\n", vif->max_lost_beacons);
 	}
 
@@ -1426,6 +1539,7 @@ static int wil_cfg80211_connect(struct wiphy *wiphy,
 	 * Sparrow FW 6.2 programs the STA BI timer from it at WMI_CONNECT; see
 	 * wmi_set_sta_bcon_int().
 	 */
+	vif->bss_bi = bss->beacon_interval;
 	if (bss->beacon_interval) {
 		int brc = wmi_set_sta_bcon_int(wil, bss->beacon_interval);
 
@@ -1440,7 +1554,8 @@ static int wil_cfg80211_connect(struct wiphy *wiphy,
 		netif_carrier_on(ndev);
 		if (!wil_has_other_active_ifaces(wil, ndev, false, true))
 			wil6210_bus_request(wil, WIL_MAX_BUS_REQUEST_KBPS);
-		vif->bss = bss;
+		wil_vif_bss_set(vif, bss);	/* keeps the reference */
+		bss = NULL;
 		/* Connect can take lots of time */
 		mod_timer(&vif->connect_timer,
 			  jiffies + msecs_to_jiffies(5000));
@@ -1457,7 +1572,8 @@ static int wil_cfg80211_connect(struct wiphy *wiphy,
 		cfg80211_disconnected(ndev, WLAN_REASON_UNSPECIFIED, NULL, 0,
 				      true, GFP_KERNEL);
 	}
-	cfg80211_put_bss(wiphy, bss);
+	if (bss)
+		cfg80211_put_bss(wiphy, bss);
 
 	return rc;
 }
@@ -1595,6 +1711,15 @@ int wil_cfg80211_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
 		return -EINVAL;
 	}
 
+	/* nl80211 reports the cookie to user space: never leave it unset
+	 * (it was uninitialised kernel stack) - and 0 is not a valid one
+	 */
+	if (cookie) {
+		*cookie = ++wil->mgmt_tx_cookie;
+		if (!*cookie)
+			*cookie = ++wil->mgmt_tx_cookie;
+	}
+
 	if (wdev->iftype != NL80211_IFTYPE_AP) {
 		wil_dbg_misc(wil,
 			     "send WMI_SW_TX_REQ_CMDID on non-AP interfaces\n");
@@ -1629,12 +1754,16 @@ out:
 	 * be -EAGAIN. In this case this function needs to return success,
 	 * the ACK=0 will be reflected in tx_status.
 	 */
+	/* a TX status only for a frame that was sent: on any other error
+	 * the request fails and no cookie was handed out
+	 */
+	if (rc && rc != -EAGAIN)
+		return rc;
 	tx_status = (rc == 0);
-	rc = (rc == -EAGAIN) ? 0 : rc;
 	cfg80211_mgmt_tx_status(wdev, cookie ? *cookie : 0, buf, len,
 				tx_status, GFP_KERNEL);
 
-	return rc;
+	return 0;
 }
 
 static int wil_cfg80211_set_channel(struct wiphy *wiphy,
@@ -2006,12 +2135,16 @@ _wil_cfg80211_get_proberesp_ies(const u8 *proberesp, u16 proberesp_len,
 				u16 *ies_len)
 {
 	u8 *ies = NULL;
+	size_t hlen = offsetof(struct ieee80211_mgmt, u.probe_resp.variable);
 
-	if (proberesp) {
+	if (ies_len)
+		*ies_len = 0;
+	/* nl80211 bounds the template only from above: a frame shorter than
+	 * the fixed part made the IE length wrap to ~64K
+	 */
+	if (proberesp && proberesp_len >= hlen) {
 		struct ieee80211_mgmt *f =
 			(struct ieee80211_mgmt *)proberesp;
-		size_t hlen = offsetof(struct ieee80211_mgmt,
-				       u.probe_resp.variable);
 
 		ies = f->u.probe_resp.variable;
 		if (ies_len)
@@ -2364,6 +2497,8 @@ static int wil_cfg80211_stop_ap(struct wiphy *wiphy,
 	wil_memdup_ie(&vif->proberesp, &vif->proberesp_len, NULL, 0);
 	wil_memdup_ie(&vif->proberesp_ies, &vif->proberesp_ies_len, NULL, 0);
 	wil_memdup_ie(&vif->assocresp_ies, &vif->assocresp_ies_len, NULL, 0);
+	/* stations added but never answered do not outlive the BSS */
+	wil_splitmac_drop_new_sta(vif, NULL);
 	memset(vif->gtk, 0, WMI_MAX_KEY_LEN);
 	vif->gtk_len = 0;
 
@@ -2796,6 +2931,135 @@ static int wil_cfg80211_set_cqm_rssi_config(struct wiphy *wiphy,
 	return rc;
 }
 
+/* IBSS over PBSS: on this HW ad-hoc is a thin label over PBSS.
+ * Creator raises the network with WMI_NETTYPE_ADHOC_CREATOR (bss_mode==2 in fw),
+ * which enables the distributed-beacon randomizer; leave stops the PCP. */
+/* Прошивка различает два типа ячейки: WMI_NETTYPE_ADHOC_CREATOR создаёт новую,
+ * WMI_NETTYPE_ADHOC присоединяется к существующей. Раньше join_ibss безусловно
+ * создавал, поэтому два узла поднимали каждый свою ячейку и друг друга не
+ * видели. Параметр позволяет второму узлу зайти присоединяющимся.
+ */
+static bool ibss_creator = true;
+module_param(ibss_creator, bool, 0644);
+MODULE_PARM_DESC(ibss_creator,
+		 " IBSS: true - создать ячейку (ADHOC_CREATOR), false - присоединиться к существующей (ADHOC)");
+
+static int wil_cfg80211_join_ibss(struct wiphy *wiphy, struct net_device *ndev,
+				  struct cfg80211_ibss_params *params)
+{
+	struct wil6210_priv *wil = wiphy_to_wil(wiphy);
+	struct wil6210_vif *vif = ndev_to_vif(ndev);
+	struct ieee80211_channel *chan_def = params->chandef.chan;
+	u8 chan = 1;
+	u8 bssid[ETH_ALEN];
+	int rc;
+
+	if (vif->mid != 0)
+		return -EOPNOTSUPP;
+
+	/* BSSID of the cell (IEEE 802.11-2020 11.1.4.4): given by userspace
+	 * ("iw ... ibss join SSID FREQ ... BSSID"), otherwise the creator picks a
+	 * random locally administered one.  A joiner has to name the cell.
+	 */
+	if (params->bssid)
+		ether_addr_copy(bssid, params->bssid);
+	else if (ibss_creator)
+		eth_random_addr(bssid);
+	else
+		return -EINVAL;
+	if (params->ssid_len > sizeof(vif->ssid))
+		return -EINVAL;
+	if (chan_def)
+		chan = chan_def->hw_value;
+	else
+		/* Userspace may leave the channel out of the request; the cell
+		 * is still created on @chan, so resolve it for the reporting
+		 * below, which needs a real channel to attach the BSS to.
+		 */
+		chan_def = ieee80211_get_channel(wiphy,
+			ieee80211_channel_to_frequency(chan,
+						       NL80211_BAND_60GHZ));
+
+	vif->privacy = params->privacy;
+	vif->channel = chan;
+	vif->pbss = true;
+	vif->bi = params->beacon_interval ? params->beacon_interval : 100;
+	memcpy(vif->ssid, params->ssid, params->ssid_len);
+	vif->ssid_len = params->ssid_len;
+
+	if (vif->ssid_len) {
+		rc = wmi_set_ssid(vif, vif->ssid_len, vif->ssid);
+		if (rc)
+			return rc;
+	}
+
+	/* firmware without the command (not SparRAW 6.4 mesh) ignores it */
+	rc = wmi_set_ibss_bssid(vif, bssid);
+	if (rc)
+		return rc;
+
+	netif_carrier_on(ndev);
+	rc = wmi_pcp_start(vif, vif->bi,
+			   ibss_creator ? WMI_NETTYPE_ADHOC_CREATOR
+					: WMI_NETTYPE_ADHOC,
+			   chan, 0 /* edmg */, 0 /* hidden_ssid */,
+			   0 /* is_go */);
+	if (rc) {
+		netif_carrier_off(ndev);
+		return rc;
+	}
+
+	/* This is a full-MAC device and the cell was just created here, so
+	 * nothing has informed cfg80211 about it yet. Publish it before
+	 * reporting the join, otherwise cfg80211_ibss_joined() finds no BSS.
+	 */
+	if (chan_def) {
+		struct cfg80211_bss *bss;
+		u8 ie[2 + IEEE80211_MAX_SSID_LEN];
+		size_t ie_len = 2 + vif->ssid_len;
+
+		ie[0] = WLAN_EID_SSID;
+		ie[1] = vif->ssid_len;
+		memcpy(ie + 2, vif->ssid, vif->ssid_len);
+
+		bss = cfg80211_inform_bss(wiphy, chan_def,
+					  CFG80211_BSS_FTYPE_PRESP,
+					  bssid, 0,
+					  WLAN_CAPABILITY_IBSS,
+					  vif->bi, ie, ie_len, 0, GFP_KERNEL);
+		if (bss)
+			cfg80211_put_bss(wiphy, bss);
+	}
+
+	cfg80211_ibss_joined(ndev, bssid, chan_def, GFP_KERNEL);
+	wil_info(wil, "IBSS %s %pM on channel %d (chan_def %s)\n",
+		 ibss_creator ? "created" : "joined", bssid,
+		 chan, chan_def ? "ok" : "missing");
+	return 0;
+}
+
+static int wil_cfg80211_leave_ibss(struct wiphy *wiphy, struct net_device *ndev)
+{
+	struct wil6210_priv *wil = wiphy_to_wil(wiphy);
+	struct wil6210_vif *vif = ndev_to_vif(ndev);
+	int rc;
+
+	netif_carrier_off(ndev);
+	mutex_lock(&wil->mutex);
+	rc = wmi_pcp_stop(vif);
+	/* the FW dropped the cell links with the PCP: release the peers,
+	 * their rings and the broadcast ring as stop_ap does, so that a
+	 * following join does not start over the stations of the old cell
+	 */
+	wil6210_disconnect_complete(vif, NULL, WLAN_REASON_DEAUTH_LEAVING);
+	vif->ssid_len = 0;
+	memset(vif->gtk, 0, WMI_MAX_KEY_LEN);
+	vif->gtk_len = 0;
+	wil_bcast_fini(vif);
+	mutex_unlock(&wil->mutex);
+	return rc;
+}
+
 static const struct cfg80211_ops wil_cfg80211_ops = {
 	.add_virtual_intf = wil_cfg80211_add_iface,
 	.del_virtual_intf = wil_cfg80211_del_iface,
@@ -2803,6 +3067,8 @@ static const struct cfg80211_ops wil_cfg80211_ops = {
 	.abort_scan = wil_cfg80211_abort_scan,
 	.connect = wil_cfg80211_connect,
 	.disconnect = wil_cfg80211_disconnect,
+	.join_ibss = wil_cfg80211_join_ibss,
+	.leave_ibss = wil_cfg80211_leave_ibss,
 	.set_wiphy_params = wil_cfg80211_set_wiphy_params,
 	.change_virtual_intf = wil_cfg80211_change_iface,
 	.get_station = wil_cfg80211_get_station,
@@ -2816,6 +3082,8 @@ static const struct cfg80211_ops wil_cfg80211_ops = {
 	.set_default_key = wil_cfg80211_set_default_key,
 	/* AP mode */
 	.change_beacon = wil_cfg80211_change_beacon,
+	.start_pmsr = wil_ftm_start,
+	.abort_pmsr = wil_ftm_abort,
 	.start_ap = wil_cfg80211_start_ap,
 	.stop_ap = wil_cfg80211_stop_ap,
 	.add_station = wil_cfg80211_add_station,
@@ -2843,6 +3111,7 @@ static void wil_wiphy_init(struct wiphy *wiphy)
 	wiphy->max_remain_on_channel_duration = WIL_MAX_ROC_DURATION_MS;
 	wiphy->max_num_pmkids = 0 /* TODO: */;
 	wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION) |
+				 BIT(NL80211_IFTYPE_ADHOC) |
 				 BIT(NL80211_IFTYPE_AP) |
 				 BIT(NL80211_IFTYPE_P2P_CLIENT) |
 				 BIT(NL80211_IFTYPE_P2P_GO) |
@@ -2873,6 +3142,7 @@ static void wil_wiphy_init(struct wiphy *wiphy)
 	wiphy->n_cipher_suites = ARRAY_SIZE(wil_cipher_suites);
 	wiphy->mgmt_stypes = wil_mgmt_stypes;
 	wiphy->features |= NL80211_FEATURE_SK_TX_STATUS;
+	wiphy->pmsr_capa = &wil_pmsr_capa;
 	wiphy->bss_param_support = WIPHY_BSS_PARAM_AP_ISOLATE;
 
 	wiphy->n_vendor_commands = ARRAY_SIZE(wil_nl80211_vendor_commands);

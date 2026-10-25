@@ -233,6 +233,8 @@ void wil_rx_bar(struct wil6210_priv *wil, struct wil6210_vif *vif,
 	wil_dbg_txrx(wil, "BAR: CID %d MID %d TID %d Seq 0x%03x head 0x%03x\n",
 		     cid, vif->mid, tid, seq, r->head_seq_num);
 	wil_release_reorder_frames(ndev, r, seq);
+	/* and the in-order run that now starts at the new WinStart */
+	wil_reorder_release(ndev, r);
 
 out:
 	spin_unlock(&sta->tid_rx_lock);

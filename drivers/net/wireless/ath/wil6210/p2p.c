@@ -39,7 +39,7 @@ static int wil_p2p_start_listen(struct wil6210_vif *vif)
 		goto out_stop;
 	}
 
-	INIT_WORK(&p2p->discovery_expired_work, wil_p2p_listen_expired);
+	p2p->is_search = false;
 	mod_timer(&p2p->discovery_timer,
 		  jiffies + msecs_to_jiffies(p2p->listen_duration));
 out_stop:
@@ -110,7 +110,7 @@ int wil_p2p_search(struct wil6210_vif *vif,
 	}
 
 	p2p->discovery_started = 1;
-	INIT_WORK(&p2p->discovery_expired_work, wil_p2p_search_expired);
+	p2p->is_search = true;
 	mod_timer(&p2p->discovery_timer,
 		  jiffies + msecs_to_jiffies(P2P_SEARCH_DURATION_MS));
 
@@ -185,6 +185,8 @@ u8 wil_p2p_stop_discovery(struct wil6210_vif *vif)
 			p2p->pending_listen_wdev = NULL;
 		} else {
 			timer_delete_sync(&p2p->discovery_timer);
+			/* an expiry already queued belongs to this session */
+			cancel_work(&p2p->discovery_expired_work);
 			wmi_stop_discovery(vif);
 		}
 		p2p->discovery_started = 0;
@@ -228,19 +230,18 @@ int wil_p2p_cancel_listen(struct wil6210_vif *vif, u64 cookie)
 	return 0;
 }
 
-void wil_p2p_listen_expired(struct work_struct *work)
+static void wil_p2p_listen_expired(struct wil6210_vif *vif)
 {
-	struct wil_p2p_info *p2p = container_of(work,
-			struct wil_p2p_info, discovery_expired_work);
-	struct wil6210_vif *vif = container_of(p2p,
-			struct wil6210_vif, p2p);
+	struct wil_p2p_info *p2p = &vif->p2p;
 	struct wil6210_priv *wil = vif_to_wil(vif);
 	u8 started;
 
 	wil_dbg_misc(wil, "p2p_listen_expired\n");
 
 	mutex_lock(&wil->mutex);
-	started = wil_p2p_stop_discovery(vif);
+	/* a new session armed the timer meanwhile: this expiry is stale */
+	started = timer_pending(&p2p->discovery_timer) ? 0 :
+		  wil_p2p_stop_discovery(vif);
 	mutex_unlock(&wil->mutex);
 
 	if (!started)
@@ -256,19 +257,16 @@ void wil_p2p_listen_expired(struct work_struct *work)
 	mutex_unlock(&wil->vif_mutex);
 }
 
-void wil_p2p_search_expired(struct work_struct *work)
+static void wil_p2p_search_expired(struct wil6210_vif *vif)
 {
-	struct wil_p2p_info *p2p = container_of(work,
-			struct wil_p2p_info, discovery_expired_work);
-	struct wil6210_vif *vif = container_of(p2p,
-			struct wil6210_vif, p2p);
 	struct wil6210_priv *wil = vif_to_wil(vif);
 	u8 started;
 
 	wil_dbg_misc(wil, "p2p_search_expired\n");
 
 	mutex_lock(&wil->mutex);
-	started = wil_p2p_stop_discovery(vif);
+	started = timer_pending(&vif->p2p.discovery_timer) ? 0 :
+		  wil_p2p_stop_discovery(vif);
 	mutex_unlock(&wil->mutex);
 
 	if (started) {
@@ -286,6 +284,23 @@ void wil_p2p_search_expired(struct work_struct *work)
 		}
 		mutex_unlock(&wil->vif_mutex);
 	}
+}
+
+/* One work for both kinds of discovery: re-initialising a work that may
+ * still be queued (INIT_WORK per session, as before) corrupts the
+ * workqueue list.
+ */
+void wil_p2p_discovery_expired(struct work_struct *work)
+{
+	struct wil_p2p_info *p2p = container_of(work,
+			struct wil_p2p_info, discovery_expired_work);
+	struct wil6210_vif *vif = container_of(p2p,
+			struct wil6210_vif, p2p);
+
+	if (p2p->is_search)
+		wil_p2p_search_expired(vif);
+	else
+		wil_p2p_listen_expired(vif);
 }
 
 void wil_p2p_delayed_listen_work(struct work_struct *work)

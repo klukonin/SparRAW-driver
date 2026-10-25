@@ -203,6 +203,8 @@ enum wmi_command_id {
 	WMI_RF_XPM_READ_CMDID				= 0x856,
 	WMI_RF_XPM_WRITE_CMDID				= 0x857,
 	WMI_LED_CFG_CMDID				= 0x858,
+	/* SparRAW FW 6.4 mesh: BSSID of the DMG IBSS cell, sent before PCP_START */
+	WMI_IBSS_BSSID_CMDID				= 0x85a,
 	WMI_REASSOC_INPLACE_CFG_CMDID			= 0x85b,
 	WMI_SET_CONNECT_SNR_THR_CMDID			= 0x85B,
 	WMI_SET_ACTIVE_SILENT_RSSI_TABLE_CMDID		= 0x85C,
@@ -816,6 +818,12 @@ struct wmi_power_mgmt_cfg_cmd {
 	u8 reserved[3];
 } __packed;
 
+/* WMI_IBSS_BSSID_CMDID (SparRAW FW 6.4 mesh), no reply */
+struct wmi_ibss_bssid_cmd {
+	u8 bssid[WMI_MAC_LEN];
+	u8 reserved[2];
+} __packed;
+
 /* WMI_REASSOC_INPLACE_CFG_CMDID (SparRAW FW 6.4, capability
  * WMI_FW_CAPABILITY_REASSOC_INPLACE), no reply: the AP answers a
  * (Re)Association Request of an associated STA in place and reports it with
@@ -837,6 +845,13 @@ enum wmi_ap_sme_offload_mode {
 };
 
 /* WMI_PCP_START_CMDID */
+/* reserved[0] bit: link with any peer found by A-BFT without roles and
+ * without an Assoc frame exchange (vendor "direct PBSS member" path, ends in
+ * WMI_PBSS_JOINED_EVENTID).  Understood by SparRAW FW 6.4; older firmware
+ * ignores the byte.  Needs oob_mode=1 (Discovery A-BFT).
+ */
+#define WMI_PCP_START_ROLELESS_LINK	BIT(0)
+
 struct wmi_pcp_start_cmd {
 	__le16 bcon_interval;
 	u8 pcp_max_assoc_sta;
@@ -845,6 +860,7 @@ struct wmi_pcp_start_cmd {
 	/* enum wmi_channel WMI_CHANNEL_9..WMI_CHANNEL_12 */
 	u8 edmg_channel;
 	u8 raw_mode;
+	/* reserved[0]: WMI_PCP_START_ROLELESS_LINK (SparRAW FW 6.4) */
 	u8 reserved[3];
 	/* A-BFT length override if non-0 */
 	u8 abft_len;

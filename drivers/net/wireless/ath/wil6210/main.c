@@ -279,6 +279,15 @@ static bool wil_vif_is_connected(struct wil6210_priv *wil, u8 mid)
 	return false;
 }
 
+/* "disconnect all" of a VIF must leave the stations of other VIFs alone */
+static bool wil_sta_of_other_vif(struct wil6210_priv *wil,
+				 struct wil6210_vif *vif, int cid)
+{
+	struct wil_sta_info *sta = &wil->sta[cid];
+
+	return sta->status != wil_sta_unused && sta->mid != vif->mid;
+}
+
 static void wil_disconnect_cid_complete(struct wil6210_vif *vif, int cid,
 					u16 reason_code)
 __acquires(&sta->tid_rx_lock) __releases(&sta->tid_rx_lock)
@@ -303,6 +312,7 @@ __acquires(&sta->tid_rx_lock) __releases(&sta->tid_rx_lock)
 		switch (wdev->iftype) {
 		case NL80211_IFTYPE_AP:
 		case NL80211_IFTYPE_P2P_GO:
+		case NL80211_IFTYPE_ADHOC:	/* IBSS peer, SparRAW FW 6.4 mesh */
 			/* AP-like interface */
 			cfg80211_del_sta(wdev, sta->addr, GFP_KERNEL);
 			break;
@@ -372,8 +382,11 @@ static void _wil6210_disconnect_complete(struct wil6210_vif *vif,
 			wil_disconnect_cid_complete(vif, cid, reason_code);
 	} else { /* all */
 		wil_dbg_misc(wil, "Disconnect complete all\n");
-		for (cid = 0; cid < wil->max_assoc_sta; cid++)
+		for (cid = 0; cid < wil->max_assoc_sta; cid++) {
+			if (wil_sta_of_other_vif(wil, vif, cid))
+				continue;
 			wil_disconnect_cid_complete(vif, cid, reason_code);
+		}
 	}
 
 	/* link state */
@@ -409,7 +422,7 @@ static void _wil6210_disconnect_complete(struct wil6210_vif *vif,
 							WLAN_STATUS_UNSPECIFIED_FAILURE,
 							GFP_KERNEL);
 			}
-			vif->bss = NULL;
+			wil_vif_bss_put(vif);
 		}
 		clear_bit(wil_vif_fwconnecting, vif->status);
 		clear_bit(wil_vif_ft_roam, vif->status);
@@ -497,8 +510,11 @@ static void _wil6210_disconnect(struct wil6210_vif *vif, const u8 *bssid,
 			wil_disconnect_cid(vif, cid, reason_code);
 	} else { /* all */
 		wil_dbg_misc(wil, "Disconnect all\n");
-		for (cid = 0; cid < wil->max_assoc_sta; cid++)
+		for (cid = 0; cid < wil->max_assoc_sta; cid++) {
+			if (wil_sta_of_other_vif(wil, vif, cid))
+				continue;
 			wil_disconnect_cid(vif, cid, reason_code);
+		}
 	}
 
 	/* call event handler manually after processing wmi_call,
@@ -753,10 +769,12 @@ int wil_priv_init(struct wil6210_priv *wil)
 	mutex_init(&wil->mutex);
 	mutex_init(&wil->vif_mutex);
 	mutex_init(&wil->wmi_mutex);
+	wil_ftm_init(wil);
 	mutex_init(&wil->halp.lock);
 
 	init_completion(&wil->wmi_ready);
 	init_completion(&wil->wmi_call);
+	init_waitqueue_head(&wil->wmi_handled_wq);
 	init_completion(&wil->halp.comp);
 
 	INIT_WORK(&wil->wmi_event_worker, wmi_event_worker);
@@ -799,7 +817,10 @@ int wil_priv_init(struct wil6210_priv *wil)
 
 	wil->reply_mid = U8_MAX;
 	wil->max_vifs = 1;
-	wil->max_assoc_sta = max_assoc_sta;
+	/* indexes wil->sta[WIL6210_MAX_CID] from the first reset on, before
+	 * FW_READY limits it to what the FW reports
+	 */
+	wil->max_assoc_sta = clamp_t(uint, max_assoc_sta, 1, WIL6210_MAX_CID);
 
 	/* edma configuration can be updated via debugfs before allocation */
 	wil->num_rx_status_rings = WIL_DEFAULT_NUM_RX_STATUS_RINGS;
@@ -873,6 +894,8 @@ void wil6210_disconnect_complete(struct wil6210_vif *vif, const u8 *bssid,
 	wil_dbg_misc(wil, "got disconnect\n");
 
 	timer_delete_sync(&vif->connect_timer);
+	/* a timeout queued for this connect must not hit the next one */
+	cancel_work(&vif->disconnect_worker);
 	_wil6210_disconnect_complete(vif, bssid, reason_code);
 }
 
@@ -887,6 +910,7 @@ void wil_priv_deinit(struct wil6210_priv *wil)
 	wil->uc_trace_buf = NULL;
 	wil->uc_trace_tmp = NULL;
 	cancel_delayed_work_sync(&wil->fw_watchdog_work);
+	cancel_delayed_work_sync(&wil->ftm.timeout_work);
 	cancel_work_sync(&wil->fw_error_worker);
 	wmi_event_flush(wil);
 	destroy_workqueue(wil->wq_service);
@@ -1307,6 +1331,9 @@ void wil_refresh_fw_capabilities(struct wil6210_priv *wil)
 		wiphy->max_match_sets = WMI_MAX_PNO_SSID_NUM;
 		wiphy->max_sched_scan_ie_len = WMI_MAX_IE_LEN;
 		wiphy->max_sched_scan_plans = WMI_MAX_PLANS_NUM;
+		/* WMI plan fields and the initial delay are 16 bit */
+		wiphy->max_sched_scan_plan_interval = U16_MAX;
+		wiphy->max_sched_scan_plan_iterations = U16_MAX;
 	}
 
 	if (test_bit(WMI_FW_CAPABILITY_TX_REQ_EXT, wil->fw_capabilities))
@@ -1740,6 +1767,12 @@ static bool wil_log_ring_arm(struct wil6210_priv *wil, u32 reg, bool fw,
 
 void wil_fw_log_enable(struct wil6210_priv *wil, u8 level)
 {
+	/* fw_log_level describes the ring of the running FW only: it is the
+	 * watchdog's licence to treat zeroed level bytes as a restart.  A
+	 * stale value (set for the FW before a reset) made the watchdog
+	 * "recover" a healthy, simply unarmed FW over and over.
+	 */
+	wil->fw_log_level = 0;
 	if (!level)
 		return;
 
@@ -1958,10 +1991,13 @@ int wil_reset(struct wil6210_priv *wil, bool load_fw)
 
 	wil_dbg_misc(wil, "reset\n");
 
+	wil_ftm_reset(wil);
+
 	WARN_ON(!mutex_is_locked(&wil->mutex));
 	WARN_ON(test_bit(wil_status_napi_en, wil->status));
 
-	cancel_delayed_work(&wil->fw_watchdog_work);
+	/* _sync: a running watchdog re-arms itself */
+	cancel_delayed_work_sync(&wil->fw_watchdog_work);
 	cancel_delayed_work(&wil->uc_trace_work);
 
 	if (debug_fw) {
@@ -2067,8 +2103,8 @@ int wil_reset(struct wil6210_priv *wil, bool load_fw)
 
 		if  (wil->secured_boot) {
 			wil_err(wil, "secured boot is not supported\n");
-			up_write(&wil->mem_lock);
-			return -ENOTSUPP;
+			rc = -ENOTSUPP;
+			goto out;	/* also clears wil_status_resetting */
 		}
 
 		board_file[0] = '\0';
@@ -2133,7 +2169,8 @@ int wil_reset(struct wil6210_priv *wil, bool load_fw)
 			return rc;
 		}
 
-		wil_fw_log_enable(wil, fw_log_level);
+		/* the level last asked for (debugfs) survives the reset */
+		wil_fw_log_enable(wil, wil->fw_log_req ?: fw_log_level);
 		wil_fw_watchdog_start(wil);
 		wil_uc_trace_start(wil);
 
@@ -2153,6 +2190,8 @@ int wil_reset(struct wil6210_priv *wil, bool load_fw)
 		}
 
 		wil_collect_fw_info(wil);
+
+		wil_ftm_fw_ready(wil);
 
 		if (wil->ps_profile != WMI_PS_PROFILE_TYPE_DEFAULT)
 			wil_ps_update(wil, wil->ps_profile);
@@ -2218,6 +2257,10 @@ int __wil_up(struct wil6210_priv *wil)
 	switch (wdev->iftype) {
 	case NL80211_IFTYPE_STATION:
 		wil_dbg_misc(wil, "type: STATION\n");
+		ndev->type = ARPHRD_ETHER;
+		break;
+	case NL80211_IFTYPE_ADHOC:
+		wil_dbg_misc(wil, "type: ADHOC\n");
 		ndev->type = ARPHRD_ETHER;
 		break;
 	case NL80211_IFTYPE_AP:

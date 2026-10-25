@@ -207,7 +207,6 @@ static void wil_vring_free(struct wil6210_priv *wil, struct wil_ring *vring)
 
 	while (!wil_ring_is_empty(vring)) {
 		dma_addr_t pa;
-		u16 dmalen;
 		struct wil_ctx *ctx;
 
 		if (!vring->is_rx) {
@@ -236,8 +235,11 @@ static void wil_vring_free(struct wil6210_priv *wil, struct wil_ring *vring)
 			ctx = &vring->ctx[vring->swhead];
 			*d = *_d;
 			pa = wil_desc_addr(&d->dma.addr);
-			dmalen = le16_to_cpu(d->dma.length);
-			dma_unmap_single(dev, pa, dmalen, DMA_FROM_DEVICE);
+			/* unmap with the mapped size (wil_vring_alloc_skb),
+			 * not the received length the HW wrote back
+			 */
+			dma_unmap_single(dev, pa, wil->rx_buf_len + ETH_HLEN +
+					 wil_rx_snaplen(), DMA_FROM_DEVICE);
 			kfree_skb(ctx->skb);
 			wil_ring_advance_head(vring, 1);
 		}
@@ -528,6 +530,19 @@ again:
 	/* no extra checks if in sniffer mode */
 	if (ndev->type != ARPHRD_ETHER)
 		return skb;
+	/* An MPDU that failed the MIC is discarded before the reordering
+	 * buffer and before replay detection (IEEE 802.11-2020 12.5.5.4.2,
+	 * 12.5.5.4.4: the replay counter follows accepted MPDUs only).  Left
+	 * in, a forged frame with a high PN made the replay check drop the
+	 * peer's traffic, and its sequence number moved the BA window.
+	 */
+	if ((d->dma.status & RX_DMA_STATUS_ERROR) &&
+	    (d->dma.error & RX_DMA_ERROR_MIC)) {
+		stats->rx_mic_error++;
+		wil_dbg_txrx(wil, "MIC error, dropping packet\n");
+		kfree_skb(skb);
+		goto again;
+	}
 	/* Non-data frames may be delivered through Rx DMA channel (ex: BAR)
 	 * Driver should recognize it by frame type, that is found
 	 * in Rx descriptor. If type is not data, it is 802.11 frame as is
@@ -962,6 +977,7 @@ void wil_netif_rx(struct sk_buff *skb, struct net_device *ndev, int cid,
 	}
 	ndev->stats.rx_packets++;
 	stats->rx_packets++;
+	wil->sta[cid].last_active = jiffies;
 	ndev->stats.rx_bytes += len;
 	stats->rx_bytes += len;
 	if (mcast)
@@ -1209,6 +1225,10 @@ static int wil_vring_init_tx(struct wil6210_vif *vif, int id, int size,
 		goto out_free;
 	}
 
+	rc = wil_hwtail_check(wil, le32_to_cpu(reply.cmd.tx_vring_tail_ptr));
+	if (rc)
+		goto out_free;
+
 	spin_lock_bh(&txdata->lock);
 	vring->hwtail = le32_to_cpu(reply.cmd.tx_vring_tail_ptr);
 	txdata->mid = vif->mid;
@@ -1378,6 +1398,10 @@ int wil_vring_init_bcast(struct wil6210_vif *vif, int id, int size)
 		rc = -EINVAL;
 		goto out_free;
 	}
+
+	rc = wil_hwtail_check(wil, le32_to_cpu(reply.cmd.tx_vring_tail_ptr));
+	if (rc)
+		goto out_free;
 
 	spin_lock_bh(&txdata->lock);
 	vring->hwtail = le32_to_cpu(reply.cmd.tx_vring_tail_ptr);
@@ -1707,6 +1731,29 @@ static int wil_tx_desc_offload_setup(struct vring_tx_desc *d,
 	d->dma.d0 |= BIT(DMA_CFG_DESC_TX_0_PSEUDO_HEADER_CALC_EN_POS);
 
 	return 0;
+}
+
+/* Can wil_tx_desc_offload_setup() describe the checksum of @skb to the HW:
+ * IPv4/IPv6 directly followed by TCP or UDP.  The driver advertises
+ * NETIF_F_HW_CSUM, so other CHECKSUM_PARTIAL frames (IPv6 extension
+ * headers, forwarded GRO traffic) must be completed in software, not
+ * dropped.
+ */
+static bool wil_tx_csum_offloadable(struct sk_buff *skb)
+{
+	int protocol;
+
+	switch (skb->protocol) {
+	case cpu_to_be16(ETH_P_IP):
+		protocol = ip_hdr(skb)->protocol;
+		break;
+	case cpu_to_be16(ETH_P_IPV6):
+		protocol = ipv6_hdr(skb)->nexthdr;
+		break;
+	default:
+		return false;
+	}
+	return protocol == IPPROTO_TCP || protocol == IPPROTO_UDP;
 }
 
 static inline void wil_tx_last_desc(struct vring_tx_desc *d)
@@ -2054,6 +2101,10 @@ static int __wil_tx_ring(struct wil6210_priv *wil, struct wil6210_vif *vif,
 		return -ENOMEM;
 	}
 	_d = &ring->va[i].tx.legacy;
+
+	if (skb->ip_summed == CHECKSUM_PARTIAL &&
+	    !wil_tx_csum_offloadable(skb) && skb_checksum_help(skb))
+		return -EINVAL;
 
 	pa = dma_map_single(dev, skb->data, skb_headlen(skb), DMA_TO_DEVICE);
 
@@ -2493,6 +2544,8 @@ int wil_tx_complete(struct wil6210_vif *vif, int ringid)
 					if (stats) {
 						stats->tx_packets++;
 						stats->tx_bytes += skb->len;
+						wil->sta[cid].last_active =
+							jiffies;
 
 						wil_tx_latency_calc(wil, skb,
 							&wil->sta[cid]);

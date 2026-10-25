@@ -304,7 +304,8 @@ static void wil_print_mbox_ring(struct seq_file *s, const char *prefix,
 		goto out;
 	}
 
-	if (!wmi_addr(wil, r.base) ||
+	if (!r.size || !wmi_addr(wil, r.base) ||
+	    !wmi_addr(wil, r.base + r.size - sizeof(u32)) ||
 	    !wmi_addr(wil, r.tail) ||
 	    !wmi_addr(wil, r.head)) {
 		seq_puts(s, "  ??? pointers are garbage?\n");
@@ -330,15 +331,13 @@ static void wil_print_mbox_ring(struct seq_file *s, const char *prefix,
 			seq_printf(s, " -> %04x %04x %04x %02x\n",
 				   le16_to_cpu(hdr.seq), len,
 				   le16_to_cpu(hdr.type), hdr.flags);
-			if (len <= MAX_MBOXITEM_SIZE) {
+			void __iomem *src = wmi_buffer_block(wil, d.addr,
+				sizeof(struct wil6210_mbox_hdr) + len);
+
+			if (len <= MAX_MBOXITEM_SIZE && src) {
 				unsigned char databuf[MAX_MBOXITEM_SIZE];
-				void __iomem *src = wmi_buffer(wil, d.addr) +
-					sizeof(struct wil6210_mbox_hdr);
-				/*
-				 * No need to check @src for validity -
-				 * we already validated @d.addr while
-				 * reading header
-				 */
+
+				src += sizeof(struct wil6210_mbox_hdr);
 				wil_memcpy_fromio_32(databuf, src, len);
 				wil_seq_hexdump(s, databuf, len, "      : ");
 			}
@@ -1349,6 +1348,11 @@ static int bf_show(struct seq_file *s, void *data)
 		u32 status;
 		u8 bf_mcs;
 
+		/* only stations in use: a FW without the link does not
+		 * answer (6.2), each query would wait for the timeout
+		 */
+		if (wil->sta[i].status == wil_sta_unused)
+			continue;
 		cmd.cid = i;
 		rc = wmi_call(wil, WMI_NOTIFY_REQ_CMDID, vif->mid,
 			      &cmd, sizeof(cmd),
@@ -1360,7 +1364,7 @@ static int bf_show(struct seq_file *s, void *data)
 
 		status = le32_to_cpu(reply.evt.status);
 		bf_mcs = le16_to_cpu(reply.evt.bf_mcs);
-		seq_printf(s, "CID %d {\n"
+		seq_printf(s, "CID %d %pM {\n"
 			   "  TSF = 0x%016llx\n"
 			   "  TxMCS = %s TxTpt = %4d\n"
 			   "  SQI = %4d\n"
@@ -1369,7 +1373,7 @@ static int bf_show(struct seq_file *s, void *data)
 			   "  Sectors(rx:tx) my %2d:%2d peer %2d:%2d\n"
 			   "  Goodput(rx:tx) %4d:%4d\n"
 			   "}\n",
-			   i,
+			   i, wil->sta[i].addr,
 			   le64_to_cpu(reply.evt.tsf),
 			   WIL_EXTENDED_MCS_CHECK(bf_mcs),
 			   le32_to_cpu(reply.evt.tx_tpt),
@@ -1658,6 +1662,7 @@ static ssize_t wil_write_file_fw_log_level(struct file *file,
 	if (rc)
 		return rc;
 
+	wil->fw_log_req = level;
 	wil_fw_log_enable(wil, level);
 	/* the level bytes double as the liveness marker, so this is also the
 	 * point where the silent-restart watchdog can start without a reset
