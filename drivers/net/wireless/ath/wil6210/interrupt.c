@@ -555,6 +555,52 @@ static bool wil_validate_mbox_regs(struct wil6210_priv *wil)
 	return true;
 }
 
+/* Sparrow (FW 6.2 and SparRAW): fwsh_diag at FW 0x857000 (host 0x91f000).
+ * The mainline RGF_FW/UCODE_ASSERT_CODE (0x91f020/0x91f028) are other fields
+ * there, not assert codes.
+ */
+#define SPARROW_FWSH_DIAG		(0x91f000)
+#define SPARROW_FW_ASSERT_CODE		(SPARROW_FWSH_DIAG + 0x0c)
+#define SPARROW_FW_ASSERT_SITE		(SPARROW_FWSH_DIAG + 0x10)
+#define SPARROW_UC_ASSERT_CODE		(SPARROW_FWSH_DIAG + 0x14)
+#define SPARROW_UC_ASSERT_SITE		(SPARROW_FWSH_DIAG + 0x18)
+#define SPARROW_MAC_CPU_PC		(0x880204)
+/* SparRAW image only: caller of the asserting function (FW DCCM 0x806a34,
+ * uCode DCCM 0x8004b4); "at" above is the exact assert call site.
+ */
+#define SPARRAW_FW_ASSERT_CALLER	(0x906a34)
+#define SPARRAW_UC_ASSERT_CALLER	(0x9404b4)
+
+static void wil_fw_error_report(struct wil6210_priv *wil)
+{
+	u32 fw_code, fw_at, uc_code, uc_at;
+
+	if (wil->hw_version >= HW_VER_TALYN) {
+		wil_err(wil,
+			"Firmware error detected, assert codes FW 0x%08x, UCODE 0x%08x\n",
+			wil_r(wil, wil->rgf_fw_assert_code_addr),
+			wil_r(wil, wil->rgf_ucode_assert_code_addr));
+		return;
+	}
+
+	fw_code = wil_r(wil, SPARROW_FW_ASSERT_CODE);
+	fw_at = wil_r(wil, SPARROW_FW_ASSERT_SITE);
+	uc_code = wil_r(wil, SPARROW_UC_ASSERT_CODE);
+	uc_at = wil_r(wil, SPARROW_UC_ASSERT_SITE);
+
+	if (strstr(wil->fw_version, "SparRAW"))
+		wil_err(wil,
+			"Firmware error: FW assert 0x%04x at 0x%08x (caller 0x%08x), uCode assert 0x%04x at 0x%05x (caller 0x%05x), uCode PC 0x%05x\n",
+			fw_code, fw_at, wil_r(wil, SPARRAW_FW_ASSERT_CALLER),
+			uc_code, uc_at, wil_r(wil, SPARRAW_UC_ASSERT_CALLER),
+			wil_r(wil, SPARROW_MAC_CPU_PC));
+	else
+		wil_err(wil,
+			"Firmware error: FW assert 0x%04x caller 0x%08x, uCode assert 0x%04x caller 0x%05x, uCode PC 0x%05x\n",
+			fw_code, fw_at, uc_code, uc_at,
+			wil_r(wil, SPARROW_MAC_CPU_PC));
+}
+
 static irqreturn_t wil6210_irq_misc(int irq, void *cookie)
 {
 	struct wil6210_priv *wil = cookie;
@@ -576,13 +622,7 @@ static irqreturn_t wil6210_irq_misc(int irq, void *cookie)
 	}
 
 	if (isr & ISR_MISC_FW_ERROR) {
-		u32 fw_assert_code = wil_r(wil, wil->rgf_fw_assert_code_addr);
-		u32 ucode_assert_code =
-			wil_r(wil, wil->rgf_ucode_assert_code_addr);
-
-		wil_err(wil,
-			"Firmware error detected, assert codes FW 0x%08x, UCODE 0x%08x\n",
-			fw_assert_code, ucode_assert_code);
+		wil_fw_error_report(wil);
 		clear_bit(wil_status_fwready, wil->status);
 		/*
 		 * do not clear @isr here - we do 2-nd part in thread

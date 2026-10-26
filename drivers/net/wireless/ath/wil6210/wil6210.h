@@ -893,6 +893,8 @@ struct wil6210_vif {
 	int bcast_ring;
 	struct cfg80211_bss *bss; /* connected bss, relevant in STA mode */
 	int locally_generated_disc; /* relevant in STA mode */
+	/* Status Code of a rejected Assoc Response (SparRAW FW), 0 - none */
+	u16 assoc_reject_status;
 	/* STA: roaming without FT — the old association is dropped silently
 	 * and WMI_CONNECT carries WMI_CONNECT_SEND_REASSOC; the result is
 	 * reported as a roam (IEEE 802.11-2020 11.3.5.4)

@@ -1317,6 +1317,74 @@ static void wmi_evt_pbss_joined(struct wil6210_vif *vif, int id,
 	wmi_evt_connect(vif, WMI_CONNECT_EVENTID, &conn, sizeof(conn));
 }
 
+static const char *wmi_disc_reason2name(u8 reason)
+{
+	switch (reason) {
+	case WMI_DIS_REASON_NO_NETWORK_AVAIL:
+		return "no network";
+	case WMI_DIS_REASON_LOST_LINK:
+		return "lost link";
+	case WMI_DIS_REASON_DISCONNECT_CMD:
+		return "disconnect command";
+	case WMI_DIS_REASON_BSS_DISCONNECTED:
+		return "disconnected by peer";
+	case WMI_DIS_REASON_AUTH_FAILED:
+		return "auth failed";
+	case WMI_DIS_REASON_ASSOC_FAILED:
+		return "assoc failed";
+	case WMI_DIS_REASON_NO_RESOURCES_AVAIL:
+		return "no resources";
+	case WMI_DIS_REASON_CSERV_DISCONNECT:
+		return "cserv disconnect";
+	case WMI_DIS_REASON_INVALID_PROFILE:
+		return "invalid profile";
+	case WMI_DIS_REASON_DOT11H_CHANNEL_SWITCH:
+		return "channel switch";
+	case WMI_DIS_REASON_PROFILE_MISMATCH:
+		return "profile mismatch";
+	case WMI_DIS_REASON_CONNECTION_EVICTED:
+		return "connection evicted";
+	case WMI_DIS_REASON_IBSS_MERGE:
+		return "IBSS merge";
+	case WMI_DIS_REASON_HIGH_TEMPERATURE:
+		return "high temperature";
+	case WMI_DIS_REASON_LINKUP_BF_FAILED:
+		return "link up: beamforming failed";
+	case WMI_DIS_REASON_LINKUP_NO_BEACON:
+		return "link up: no beacon from peer";
+	case WMI_DIS_REASON_LINKUP_NOT_ASSOC_READY:
+		return "link up: PCP not ready for association";
+	case WMI_DIS_REASON_ASSOC_REJECTED:
+		return "association rejected, proto = status code";
+	case WMI_DIS_REASON_ASSOC_BAD_AID:
+		return "association: invalid AID, proto = AID";
+	case WMI_DIS_REASON_ASSOC_TIMEOUT:
+		return "association timeout";
+	case WMI_DIS_REASON_CONNECT_REJECTED:
+		return "connect rejected by FW";
+	case WMI_DIS_REASON_LOST_LINK_BF:
+		return "lost link: beamforming failed";
+	case WMI_DIS_REASON_LOST_LINK_TX_AGEING:
+		return "lost link: TX stalled";
+	case WMI_DIS_REASON_LOST_LINK_BCN_FAIL:
+		return "lost link: beacon/ATIM failure";
+	case WMI_DIS_REASON_LOST_LINK_NO_BEACONS:
+		return "lost link: no beacons";
+	case WMI_DIS_REASON_PEER_RESTARTED:
+		return "peer restarted";
+	case WMI_DIS_REASON_RF_KILL:
+		return "RF kill";
+	case WMI_DIS_REASON_PCIE_LINK_DOWN:
+		return "PCIe link down";
+	case WMI_DIS_REASON_PCIE_CPL_TIMEOUT:
+		return "PCIe completion timeout";
+	case WMI_DIS_REASON_PCIE_DEBUG_FIFO:
+		return "PCIe debug FIFO";
+	default:
+		return "unknown";
+	}
+}
+
 static void wmi_evt_disconnect(struct wil6210_vif *vif, int id,
 			       void *d, int len)
 {
@@ -1324,8 +1392,13 @@ static void wmi_evt_disconnect(struct wil6210_vif *vif, int id,
 	struct wmi_disconnect_event *evt = d;
 	u16 reason_code = le16_to_cpu(evt->protocol_reason_status);
 
-	wil_info(wil, "Disconnect %pM reason [proto %d wmi %d]\n",
-		 evt->bssid, reason_code, evt->disconnect_reason);
+	wil_info(wil, "Disconnect %pM mid %d reason [proto %d wmi %d: %s]\n",
+		 evt->bssid, vif->mid, reason_code, evt->disconnect_reason,
+		 wmi_disc_reason2name(evt->disconnect_reason));
+	/* report the AP's Status Code instead of "unspecified failure" */
+	if (evt->disconnect_reason == WMI_DIS_REASON_ASSOC_REJECTED &&
+	    reason_code != WLAN_STATUS_SUCCESS)
+		vif->assoc_reject_status = reason_code;
 
 	wil->sinfo_gen++;
 

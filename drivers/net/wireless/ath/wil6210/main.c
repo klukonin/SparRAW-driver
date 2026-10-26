@@ -419,11 +419,13 @@ static void _wil6210_disconnect_complete(struct wil6210_vif *vif,
 			} else {
 				cfg80211_connect_result(ndev, bssid, NULL, 0,
 							NULL, 0,
+							vif->assoc_reject_status ?:
 							WLAN_STATUS_UNSPECIFIED_FAILURE,
 							GFP_KERNEL);
 			}
 			wil_vif_bss_put(vif);
 		}
+		vif->assoc_reject_status = 0;
 		clear_bit(wil_vif_fwconnecting, vif->status);
 		clear_bit(wil_vif_ft_roam, vif->status);
 		vif->ptk_rekey_state = WIL_REKEY_IDLE;
