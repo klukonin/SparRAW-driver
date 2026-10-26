@@ -233,7 +233,17 @@ static int wil_rx_refill_edma(struct wil6210_priv *wil)
 	struct wil_ring *ring = &wil->ring_rx;
 	u32 next_head;
 	int rc = 0;
-	ring->swtail = *ring->edma_rx_swtail.va;
+	u32 swtail = READ_ONCE(*ring->edma_rx_swtail.va);
+
+	/* written by the HW: outside the ring the loop below would refill
+	 * descriptors the HW still owns, until buff IDs run out
+	 */
+	if (unlikely(swtail >= ring->size)) {
+		wil_err_ratelimited(wil, "RX swtail %u out of ring (%d)\n",
+				    swtail, ring->size);
+		return -EFAULT;
+	}
+	ring->swtail = swtail;
 
 	for (; next_head = wil_ring_next_head(ring),
 	     (next_head != ring->swtail);
@@ -434,6 +444,8 @@ static void wil_ring_free_edma(struct wil6210_priv *wil, struct wil_ring *ring)
 		dma_free_coherent(dev, sizeof(*ring->edma_rx_swtail.va),
 				  ring->edma_rx_swtail.va,
 				  ring->edma_rx_swtail.pa);
+		ring->edma_rx_swtail.va = NULL;
+		ring->edma_rx_swtail.pa = 0;
 		goto out;
 	}
 
@@ -574,7 +586,7 @@ static bool wil_is_rx_idle_edma(struct wil6210_priv *wil)
 	u8 dr_bit;
 	int i;
 
-	for (i = 0; i < wil->num_rx_status_rings; i++) {
+	for (i = 0; i < wil->num_rx_srings_used; i++) {
 		sring = &wil->srings[i];
 		if (!sring->va)
 			continue;
@@ -612,15 +624,26 @@ static int wil_rx_init_edma(struct wil6210_priv *wil, uint desc_ring_order)
 			"compressed RX status cannot be used with SW reorder\n");
 		return -EINVAL;
 	}
+	/* Range first, then "status ring larger than the descriptor ring":
+	 * clamping to the range afterwards (as before) could undo the second
+	 * (descriptor order 15 -> status 16 -> default 12), leaving fewer buff
+	 * IDs than descriptors and rx_init failing on refill.
+	 */
+	if (wil->rx_status_ring_order < WIL_SRING_SIZE_ORDER_MIN ||
+	    wil->rx_status_ring_order > WIL_SRING_SIZE_ORDER_MAX)
+		wil->rx_status_ring_order = WIL_RX_SRING_SIZE_ORDER_DEFAULT;
+	if (desc_ring_order >= WIL_SRING_SIZE_ORDER_MAX) {
+		wil_info(wil, "rx ring order %u reduced to %u (status ring)\n",
+			 desc_ring_order, WIL_SRING_SIZE_ORDER_MAX - 1);
+		desc_ring_order = WIL_SRING_SIZE_ORDER_MAX - 1;
+		desc_ring_size = 1 << desc_ring_order;
+	}
 	if (wil->rx_status_ring_order <= desc_ring_order)
 		/* make sure sring is larger than desc ring */
 		wil->rx_status_ring_order = desc_ring_order + 1;
 	if (wil->rx_buff_id_count <= desc_ring_size)
 		/* make sure we will not run out of buff_ids */
 		wil->rx_buff_id_count = desc_ring_size + 512;
-	if (wil->rx_status_ring_order < WIL_SRING_SIZE_ORDER_MIN ||
-	    wil->rx_status_ring_order > WIL_SRING_SIZE_ORDER_MAX)
-		wil->rx_status_ring_order = WIL_RX_SRING_SIZE_ORDER_DEFAULT;
 
 	status_ring_size = 1 << wil->rx_status_ring_order;
 
@@ -630,19 +653,28 @@ static int wil_rx_init_edma(struct wil6210_priv *wil, uint desc_ring_order)
 
 	wil_rx_buf_len_init_edma(wil);
 
-	/* Use debugfs dbg_num_rx_srings if set, reserve one sring for TX */
+	/* Use debugfs dbg_num_rx_srings if set, reserve one sring for TX; at
+	 * least one: with none the descriptor ring was bound to sring 0,
+	 * which TX init then took as its status ring
+	 */
 	if (wil->num_rx_status_rings > WIL6210_MAX_STATUS_RINGS - 1)
 		wil->num_rx_status_rings = WIL6210_MAX_STATUS_RINGS - 1;
+	if (!wil->num_rx_status_rings)
+		wil->num_rx_status_rings = 1;
+	/* what the rings below are built with; debugfs may change the wanted
+	 * number while they run
+	 */
+	wil->num_rx_srings_used = wil->num_rx_status_rings;
 
 	wil_dbg_misc(wil, "rx_init: allocate %d status rings\n",
-		     wil->num_rx_status_rings);
+		     wil->num_rx_srings_used);
 
 	rc = wil_wmi_cfg_def_rx_offload(wil, wil->rx_buf_len);
 	if (rc)
 		return rc;
 
 	/* Allocate status ring */
-	for (i = 0; i < wil->num_rx_status_rings; i++) {
+	for (i = 0; i < wil->num_rx_srings_used; i++) {
 		int sring_id = wil_find_free_sring(wil);
 
 		if (sring_id < 0) {
@@ -685,7 +717,7 @@ err_free_rx_buff_arr:
 err_free_desc:
 	wil_ring_free_edma(wil, ring);
 err_free_status:
-	for (i = 0; i < wil->num_rx_status_rings; i++)
+	for (i = 0; i < wil->num_rx_srings_used; i++)
 		wil_sring_free(wil, &wil->srings[i]);
 
 	return rc;
@@ -889,10 +921,16 @@ again:
 		if (++invalid_buff_id_retry > MAX_INVALID_BUFF_ID_RETRY)
 			break;
 
-		/* Read the status message again */
+		/* Read the status message again: only elem_size bytes - a
+		 * compressed status (the Talyn default) is 16 bytes, the
+		 * extended struct 32, which read past the ring end on the
+		 * last element.  The HW writes the ring: re-read after a
+		 * barrier.
+		 */
 		s = (struct wil_rx_status_extended *)
 			(sring->va + (sring->elem_size * sring->swhead));
-		*(struct wil_rx_status_extended *)msg = *s;
+		dma_rmb();
+		memcpy(msg, s, sring->elem_size);
 		buff_id = le16_to_cpu(wil_rx_status_get_buff_id(msg));
 	}
 
@@ -1075,7 +1113,7 @@ void wil_rx_handle_edma(struct wil6210_priv *wil, int *quota)
 	}
 	wil_dbg_txrx(wil, "rx_handle\n");
 
-	for (i = 0; i < wil->num_rx_status_rings; i++) {
+	for (i = 0; i < wil->num_rx_srings_used; i++) {
 		sring = &wil->srings[i];
 		if (unlikely(!sring->va)) {
 			wil_err(wil,
@@ -1173,6 +1211,8 @@ int wil_tx_sring_handler(struct wil6210_priv *wil,
 	struct wil6210_vif *vif;
 	int used_before_complete;
 	int used_new;
+	unsigned long done_mids = 0;	/* VIFs with completions in the batch */
+	unsigned int m;
 
 	wil_get_next_tx_status_msg(sring, &dr_bit, &msg);
 
@@ -1220,6 +1260,16 @@ int wil_tx_sring_handler(struct wil6210_priv *wil,
 			     ring_id, num_descs);
 
 		used_before_complete = wil_ring_used_tx(ring);
+		/* the count comes from the HW: never complete descriptors that
+		 * are not in flight (swtail would pass swhead)
+		 */
+		if (unlikely(num_descs > used_before_complete)) {
+			wil_err_ratelimited(wil,
+					    "Tx ring[%d]: %d completions for %d in flight\n",
+					    ring_id, num_descs,
+					    used_before_complete);
+			num_descs = used_before_complete;
+		}
 
 		for (i = 0 ; i < num_descs; ++i) {
 			struct wil_ctx *ctx = &ring->ctx[ring->swtail];
@@ -1280,6 +1330,9 @@ int wil_tx_sring_handler(struct wil6210_priv *wil,
 			desc_cnt++;
 		}
 
+		if (num_descs)
+			__set_bit(txdata->mid, &done_mids);
+
 		/* performance monitoring */
 		used_new = wil_ring_used_tx(ring);
 		if (wil_val_in_range(wil->ring_idle_trsh,
@@ -1300,9 +1353,15 @@ again:
 		wil_get_next_tx_status_msg(sring, &dr_bit, &msg);
 	}
 
-	/* shall we wake net queues? */
+	/* shall we wake net queues?  Every VIF that got completions, not
+	 * only the one of the last status (a stopped VIF whose status was not
+	 * the last stayed stopped for good once its ring drained)
+	 */
 	if (desc_cnt)
-		wil_update_net_queues(wil, vif, NULL, false);
+		for_each_set_bit(m, &done_mids, GET_MAX_VIFS(wil))
+			if (wil->vifs[m])
+				wil_update_net_queues(wil, wil->vifs[m], NULL,
+						      false);
 
 	if (num_statuses % WIL_EDMA_TX_SRING_UPDATE_HW_TAIL != 0)
 		/* Update the HW tail ptr (RD ptr) */
@@ -1610,7 +1669,7 @@ static void wil_rx_fini_edma(struct wil6210_priv *wil)
 
 	wil_ring_free_edma(wil, ring);
 
-	for (i = 0; i < wil->num_rx_status_rings; i++) {
+	for (i = 0; i < wil->num_rx_srings_used; i++) {
 		wil_rx_data_free(&wil->srings[i]);
 		wil_sring_free(wil, &wil->srings[i]);
 	}

@@ -1068,7 +1068,8 @@ struct wil6210_priv {
 	struct wil_ring ring_tx[WIL6210_MAX_TX_RINGS];
 	struct wil_ring_tx_data ring_tx_data[WIL6210_MAX_TX_RINGS];
 	struct wil_status_ring srings[WIL6210_MAX_STATUS_RINGS];
-	u8 num_rx_status_rings;
+	u8 num_rx_status_rings;	/* wanted (debugfs), applied at rx_init */
+	u8 num_rx_srings_used;	/* RX status rings of the running rx_init */
 	int tx_sring_idx;
 	u8 ring2cid_tid[WIL6210_MAX_TX_RINGS][2]; /* [0] - CID, [1] - TID */
 	struct wil_sta_info sta[WIL6210_MAX_CID];

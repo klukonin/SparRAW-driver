@@ -138,6 +138,17 @@ __acquires(&sta->tid_rx_lock) __releases(&sta->tid_rx_lock)
 	 * Another scenario, Rx get delayed and we got packet from before
 	 * BACK. Pass it to the stack and wait.
 	 */
+	/* A conformant originator sends the SN of its first MSDU under the
+	 * agreement as SSN (IEEE 802.11-2020 9.4.1.8): a first frame within
+	 * [SSN, SSN + WinSize) is just reordered (10.25.6.6, e.g. the SSN frame
+	 * was lost or comes later).  Only a first frame outside the window -
+	 * a peer that sends a wrong SSN (vendor 6.2 sends 0 and starts at
+	 * 0x800) - moves the window to it.
+	 */
+	if (r->first_time && seq != r->head_seq_num &&
+	    !seq_less(seq, r->head_seq_num) &&
+	    seq_less(seq, r->head_seq_num + r->buf_size))
+		r->first_time = false;
 	if (r->first_time) {
 		r->first_time = false;
 		if (seq != r->head_seq_num) {

@@ -83,8 +83,12 @@ static void wil_print_ring(struct seq_file *s, struct wil6210_priv *wil,
 	seq_printf(s, "  pa     = %pad\n", &ring->pa);
 	seq_printf(s, "  va     = 0x%p\n", ring->va);
 	seq_printf(s, "  size   = %d\n", ring->size);
-	if (wil->use_enhanced_dma_hw && ring->is_rx)
-		seq_printf(s, "  swtail = %u\n", *ring->edma_rx_swtail.va);
+	if (wil->use_enhanced_dma_hw && ring->is_rx) {
+		if (ring->va && ring->edma_rx_swtail.va)
+			seq_printf(s, "  swtail = %u\n", *ring->edma_rx_swtail.va);
+		else
+			seq_puts(s, "  swtail = N/A\n");
+	}
 	else
 		seq_printf(s, "  swtail = %d\n", ring->swtail);
 	seq_printf(s, "  swhead = %d\n", ring->swhead);
@@ -135,6 +139,8 @@ static int ring_show(struct seq_file *s, void *data)
 	uint i;
 	struct wil6210_priv *wil = s->private;
 
+	/* rings are freed and re-created under wil->mutex (ifdown, reset) */
+	mutex_lock(&wil->mutex);
 	wil_print_ring(s, wil, "rx", &wil->ring_rx, 'S', '_');
 
 	for (i = 0; i < ARRAY_SIZE(wil->ring_tx); i++) {
@@ -187,6 +193,7 @@ static int ring_show(struct seq_file *s, void *data)
 		}
 	}
 
+	mutex_unlock(&wil->mutex);
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(ring);
@@ -1122,8 +1129,11 @@ static int txdesc_show(struct seq_file *s, void *data)
 	struct wil6210_priv *wil = s->private;
 	struct wil_ring *ring;
 	bool tx;
-	int ring_idx = dbg_ring_index;
-	int txdesc_idx = dbg_txdesc_index;
+	/* u32 as written by the user: an int let 0xffffffff pass the bounds
+	 * checks as -1 and index ring_tx[-1] / ctx[-1]
+	 */
+	u32 ring_idx = dbg_ring_index;
+	u32 txdesc_idx = dbg_txdesc_index;
 	volatile struct vring_tx_desc *d;
 	volatile u32 *u;
 	struct sk_buff *skb;
@@ -1131,14 +1141,14 @@ static int txdesc_show(struct seq_file *s, void *data)
 	if (wil->use_enhanced_dma_hw) {
 		/* RX ring index == 0 */
 		if (ring_idx >= WIL6210_MAX_TX_RINGS) {
-			seq_printf(s, "invalid ring index %d\n", ring_idx);
+			seq_printf(s, "invalid ring index %u\n", ring_idx);
 			return 0;
 		}
 		tx = ring_idx > 0; /* desc ring 0 is reserved for RX */
 	} else {
 		/* RX ring index == WIL6210_MAX_TX_RINGS */
 		if (ring_idx > WIL6210_MAX_TX_RINGS) {
-			seq_printf(s, "invalid ring index %d\n", ring_idx);
+			seq_printf(s, "invalid ring index %u\n", ring_idx);
 			return 0;
 		}
 		tx = (ring_idx < WIL6210_MAX_TX_RINGS);
@@ -1156,10 +1166,10 @@ static int txdesc_show(struct seq_file *s, void *data)
 
 	if (txdesc_idx >= ring->size) {
 		if (tx)
-			seq_printf(s, "[%2d] TxDesc index (%d) >= size (%d)\n",
+			seq_printf(s, "[%2u] TxDesc index (%u) >= size (%d)\n",
 				   ring_idx, txdesc_idx, ring->size);
 		else
-			seq_printf(s, "RxDesc index (%d) >= size (%d)\n",
+			seq_printf(s, "RxDesc index (%u) >= size (%d)\n",
 				   txdesc_idx, ring->size);
 		return 0;
 	}
@@ -1215,14 +1225,14 @@ DEFINE_SHOW_ATTRIBUTE(txdesc);
 static int status_msg_show(struct seq_file *s, void *data)
 {
 	struct wil6210_priv *wil = s->private;
-	int sring_idx = dbg_sring_index;
+	u32 sring_idx = dbg_sring_index;	/* u32: see txdesc_show */
 	struct wil_status_ring *sring;
 	bool tx;
 	u32 status_msg_idx = dbg_status_msg_index;
 	u32 *u;
 
 	if (sring_idx >= WIL6210_MAX_STATUS_RINGS) {
-		seq_printf(s, "invalid status ring index %d\n", sring_idx);
+		seq_printf(s, "invalid status ring index %u\n", sring_idx);
 		return 0;
 	}
 

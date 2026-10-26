@@ -28,6 +28,7 @@ SparRAW (деление на open/pro есть только у прошивки)
 | лог прошивки (`fw_log_level`, debugfs), сторож тихого перезапуска `fw_watchdog_ms`; лог и трасса ucode (`uc_trace_ms`, debugfs `uc_trace`); debugfs `mem_write` |
 | сброс TX-колец при сбросе устройства |
 | станция принимает BI и `dot11MaxLostBeacons` (1..32) из BSS (802.11-2020 11.1.3.3.1, 11.1.3.1) |
+| `wmi_echo = 100`: FW 6.2.0.1000 переиспользует WMI_ECHO как «set beacon interval» — историческое `0x12345678` давало BI ≈ 22,7 с и пустой линк (SparRAW-docs `research/WMI-ECHO-BI-6200.md`) |
 | роуминг без FT — переассоциация; переассоциация связанной станции на месте (`WMI_REASSOC_INPLACE_CFG`) |
 | split MAC: `WMI_NEW_STA` только после отправленного ответа на ассоциацию |
 | FTM-инициатор через cfg80211 peer measurement, калибровка TOF |
