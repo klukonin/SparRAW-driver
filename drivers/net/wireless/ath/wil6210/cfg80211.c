@@ -2478,6 +2478,7 @@ static int wil_cfg80211_stop_ap(struct wiphy *wiphy,
 	struct wil6210_priv *wil = wiphy_to_wil(wiphy);
 	struct wil6210_vif *vif = ndev_to_vif(ndev);
 	bool last;
+	int rc;
 
 	wil_dbg_misc(wil, "stop_ap, mid=%d\n", vif->mid);
 
@@ -2491,7 +2492,13 @@ static int wil_cfg80211_stop_ap(struct wiphy *wiphy,
 
 	mutex_lock(&wil->mutex);
 
-	wmi_pcp_stop(vif);
+	/* the AP state is torn down regardless: cfg80211 must not keep
+	 * beaconing state for a PCP the FW failed to stop
+	 */
+	rc = wmi_pcp_stop(vif);
+	if (rc)
+		wil_err(wil, "stop_ap mid %d: PCP_STOP failed, rc %d\n",
+			vif->mid, rc);
 	clear_bit(wil_vif_ft_roam, vif->status);
 	vif->ssid_len = 0;
 	wil_memdup_ie(&vif->proberesp, &vif->proberesp_len, NULL, 0);

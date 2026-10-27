@@ -3939,14 +3939,14 @@ static void wmi_event_handle(struct wil6210_priv *wil,
 		if (mid == MID_BROADCAST)
 			mid = 0;
 		if (mid >= GET_MAX_VIFS(wil)) {
-			wil_dbg_wmi(wil, "invalid mid %d, event skipped\n",
-				    mid);
+			wil_err_ratelimited(wil, "%s (0x%04x) for invalid mid %d, event skipped\n",
+					    eventid2name(id), id, mid);
 			return;
 		}
 		vif = wil->vifs[mid];
 		if (!vif) {
-			wil_dbg_wmi(wil, "event for empty VIF(%d), skipped\n",
-				    mid);
+			wil_err_ratelimited(wil, "%s (0x%04x) for empty VIF(%d), skipped\n",
+					    eventid2name(id), id, mid);
 			return;
 		}
 
@@ -4263,8 +4263,15 @@ int wmi_mgmt_tx(struct wil6210_vif *vif, const u8 *buf, size_t len)
 	rc = wmi_call(wil, WMI_SW_TX_REQ_CMDID, vif->mid, cmd, total,
 		      WMI_SW_TX_COMPLETE_EVENTID, &evt, sizeof(evt), 2000);
 	if (!rc && evt.evt.status != WMI_FW_STATUS_SUCCESS) {
-		wil_dbg_wmi(wil, "mgmt_tx failed with status %d\n",
-			    evt.evt.status);
+		/* no ACK is routine (reported to cfg80211 as ack=0) */
+		if (evt.evt.status != WMI_TX_SW_STATUS_FAILED_TX)
+			wil_err_ratelimited(wil, "mgmt_tx to %pM fc 0x%04x mid %d: FW status %d\n",
+					    mgmt_frame->da,
+					    le16_to_cpu(mgmt_frame->frame_control),
+					    vif->mid, evt.evt.status);
+		else
+			wil_dbg_wmi(wil, "mgmt_tx failed with status %d\n",
+				    evt.evt.status);
 		rc = -EAGAIN;
 	}
 
@@ -4317,8 +4324,15 @@ int wmi_mgmt_tx_ext(struct wil6210_vif *vif, const u8 *buf, size_t len,
 	rc = wmi_call(wil, WMI_SW_TX_REQ_EXT_CMDID, vif->mid, cmd, total,
 		      WMI_SW_TX_COMPLETE_EVENTID, &evt, sizeof(evt), 2000);
 	if (!rc && evt.evt.status != WMI_FW_STATUS_SUCCESS) {
-		wil_dbg_wmi(wil, "mgmt_tx_ext failed with status %d\n",
-			    evt.evt.status);
+		/* no ACK is routine (reported to cfg80211 as ack=0) */
+		if (evt.evt.status != WMI_TX_SW_STATUS_FAILED_TX)
+			wil_err_ratelimited(wil, "mgmt_tx_ext to %pM fc 0x%04x mid %d: FW status %d\n",
+					    mgmt_frame->da,
+					    le16_to_cpu(mgmt_frame->frame_control),
+					    vif->mid, evt.evt.status);
+		else
+			wil_dbg_wmi(wil, "mgmt_tx_ext failed with status %d\n",
+				    evt.evt.status);
 		rc = -EAGAIN;
 	}
 

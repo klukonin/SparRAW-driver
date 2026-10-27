@@ -225,8 +225,11 @@ static int wil_if_pcie_enable(struct wil6210_priv *wil)
 	}
 
 	rc = wil6210_init_irq(wil, pdev->irq);
-	if (rc)
+	if (rc) {
+		wil_err(wil, "request irq %d (n_msi %d) failed, rc %d\n",
+			pdev->irq, wil->n_msi, rc);
 		goto release_vectors;
+	}
 
 	/* need reset here to obtain MAC */
 	mutex_lock(&wil->mutex);
@@ -358,7 +361,7 @@ static int wil_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	rc = pci_request_region(pdev, 0, WIL_NAME);
 	if (rc) {
-		wil_err(wil, "pci_request_region failed\n");
+		wil_err(wil, "pci_request_region failed, rc %d\n", rc);
 		goto err_disable_pdev;
 	}
 	/* rollback to err_release_reg */
@@ -404,7 +407,7 @@ static int wil_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	/* FW should raise IRQ when ready */
 	rc = wil_if_pcie_enable(wil);
 	if (rc) {
-		wil_err(wil, "Enable device failed\n");
+		wil_err(wil, "Enable device failed, rc %d\n", rc);
 		goto err_iounmap;
 	}
 	/* rollback to bus_disable */
