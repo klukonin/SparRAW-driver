@@ -309,7 +309,7 @@ static int wil_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	int i, start_idx;
 
 	/* check HW */
-	dev_info(&pdev->dev, WIL_NAME
+	dev_info(&pdev->dev, WIL_NAME " " WIL_SPARRAW_VERSION
 		 " device found [%04x:%04x] (rev %x) bar size 0x%x\n",
 		 (int)pdev->vendor, (int)pdev->device, (int)pdev->revision,
 		 bar_size);
@@ -689,3 +689,4 @@ module_exit(wil6210_driver_exit);
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_AUTHOR("Qualcomm Atheros <wil6210@qca.qualcomm.com>");
 MODULE_DESCRIPTION("Driver for 60g WiFi WIL6210 card");
+MODULE_VERSION(WIL_SPARRAW_VERSION);

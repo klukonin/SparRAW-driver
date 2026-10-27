@@ -35,6 +35,8 @@ struct wil6210_vif;
 union wil_tx_desc;
 
 #define WIL_NAME "wil6210"
+/* SparRAW driver release: date of the published snapshot (modinfo, /sys/module/wil6210/version) */
+#define WIL_SPARRAW_VERSION "SparRAW-2026.10.27"
 
 #define WIL_FW_NAME_DEFAULT "wil6210.fw"
 #define WIL_FW_NAME_FTM_DEFAULT "wil6210_ftm.fw"
