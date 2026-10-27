@@ -2552,8 +2552,13 @@ int wil_tx_complete(struct wil6210_vif *vif, int ringid)
 					}
 				} else {
 					ndev->stats.tx_errors++;
-					if (stats)
+					if (stats) {
 						stats->tx_errors++;
+						stats->tx_last_error = d->dma.error;
+					}
+					if (net_ratelimit())
+						wil_dbg_txrx(wil, "TxC ring %d cid %d err 0x%02x\n",
+							     ringid, cid, d->dma.error);
 				}
 
 				if (skb->protocol == cpu_to_be16(ETH_P_PAE))

@@ -1810,6 +1810,8 @@ __acquires(&p->tid_rx_lock) __releases(&p->tid_rx_lock)
 				   p->stats.rx_short_frame,
 				   p->stats.rx_large_frame,
 				   p->stats.rx_replay);
+			seq_printf(s, "Tx errors %lu, last error 0x%02x\n",
+				   p->stats.tx_errors, p->stats.tx_last_error);
 			seq_printf(s,
 				   "mic error %lu, key error %lu, amsdu error %lu, csum error %lu\n",
 				   p->stats.rx_mic_error,

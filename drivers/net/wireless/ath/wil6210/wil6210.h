@@ -591,6 +591,7 @@ struct wil_net_stats {
 	unsigned long	rx_bytes;
 	unsigned long	tx_bytes;
 	unsigned long	tx_errors;
+	u8 tx_last_error;	/* DMA error (legacy) / status (EDMA) of the last failed TX */
 	u32 tx_latency_min_us;
 	u32 tx_latency_max_us;
 	u64 tx_latency_total_us;

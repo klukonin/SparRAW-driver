@@ -1308,8 +1308,13 @@ int wil_tx_sring_handler(struct wil6210_priv *wil,
 					}
 				} else {
 					ndev->stats.tx_errors++;
-					if (stats)
+					if (stats) {
 						stats->tx_errors++;
+						stats->tx_last_error = msg.status;
+					}
+					if (net_ratelimit())
+						wil_dbg_txrx(wil, "TxC ring %d cid %d status 0x%02x\n",
+							     ring_id, cid, msg.status);
 				}
 
 				if (skb->protocol == cpu_to_be16(ETH_P_PAE))
