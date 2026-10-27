@@ -678,7 +678,8 @@ static int __wmi_send(struct wil6210_priv *wil, u16 cmdid, u8 mid,
 	int rc = 0;
 
 	if (len > r->entry_size - sizeof(cmd)) {
-		wil_err(wil, "WMI size too large: %d bytes, max is %d\n",
+		wil_err(wil, "WMI %s (0x%04x) mid %d: size too large: %d bytes, max is %d\n",
+			cmdid2name(cmdid), cmdid, mid,
 			(int)(sizeof(cmd) + len), r->entry_size);
 		return -ERANGE;
 	}
@@ -686,7 +687,8 @@ static int __wmi_send(struct wil6210_priv *wil, u16 cmdid, u8 mid,
 	might_sleep();
 
 	if (!test_bit(wil_status_fwready, wil->status)) {
-		wil_err(wil, "WMI: cannot send command while FW not ready\n");
+		wil_err(wil, "WMI %s (0x%04x) mid %d: cannot send command while FW not ready\n",
+			cmdid2name(cmdid), cmdid, mid);
 		return -EAGAIN;
 	}
 
@@ -696,12 +698,14 @@ static int __wmi_send(struct wil6210_priv *wil, u16 cmdid, u8 mid,
 	     test_bit(wil_status_resuming, wil->status)) &&
 	     ((cmdid != WMI_TRAFFIC_SUSPEND_CMDID) &&
 	      (cmdid != WMI_TRAFFIC_RESUME_CMDID))) {
-		wil_err(wil, "WMI: reject send_command during suspend\n");
+		wil_err(wil, "WMI %s (0x%04x) mid %d: reject send_command during suspend\n",
+			cmdid2name(cmdid), cmdid, mid);
 		return -EINVAL;
 	}
 
 	if (!head) {
-		wil_err(wil, "WMI head is garbage: 0x%08x\n", r->head);
+		wil_err(wil, "WMI %s (0x%04x) mid %d: head is garbage: 0x%08x\n",
+			cmdid2name(cmdid), cmdid, mid, r->head);
 		return -EINVAL;
 	}
 
@@ -715,7 +719,8 @@ static int __wmi_send(struct wil6210_priv *wil, u16 cmdid, u8 mid,
 		msleep(20);
 	}
 	if (d_head.sync != 0) {
-		wil_err(wil, "WMI head busy\n");
+		wil_err(wil, "WMI %s (0x%04x) mid %d: head busy\n",
+			cmdid2name(cmdid), cmdid, mid);
 		rc = -EBUSY;
 		goto out;
 	}
@@ -725,7 +730,8 @@ static int __wmi_send(struct wil6210_priv *wil, u16 cmdid, u8 mid,
 	/* wait till FW finish with previous command */
 	for (retry = 5; retry > 0; retry--) {
 		if (!test_bit(wil_status_fwready, wil->status)) {
-			wil_err(wil, "WMI: cannot send command while FW not ready\n");
+			wil_err(wil, "WMI %s (0x%04x) mid %d: cannot send command while FW not ready\n",
+				cmdid2name(cmdid), cmdid, mid);
 			rc = -EAGAIN;
 			goto out;
 		}
@@ -736,7 +742,8 @@ static int __wmi_send(struct wil6210_priv *wil, u16 cmdid, u8 mid,
 		msleep(20);
 	}
 	if (next_head == r->tail) {
-		wil_err(wil, "WMI ring full\n");
+		wil_err(wil, "WMI %s (0x%04x) mid %d: ring full\n",
+			cmdid2name(cmdid), cmdid, mid);
 		rc = -EBUSY;
 		goto out;
 	}
@@ -2512,8 +2519,9 @@ static int __wmi_call(struct wil6210_priv *wil, u16 cmdid, u8 mid, void *buf,
 	remain = wait_for_completion_timeout(&wil->wmi_call,
 					     msecs_to_jiffies(to_msec));
 	if (0 == remain) {
-		wil_err(wil, "wmi_call(0x%04x->0x%04x) timeout %d msec\n",
-			cmdid, reply_id, to_msec);
+		wil_err(wil, "wmi_call(%s 0x%04x -> %s 0x%04x) mid %d timeout %d msec\n",
+			cmdid2name(cmdid), cmdid, eventid2name(reply_id),
+			reply_id, mid, to_msec);
 		rc = -ETIME;
 	} else {
 		wil_dbg_wmi(wil,
@@ -2544,8 +2552,9 @@ out:
 	if (seq && !rc &&
 	    !wait_event_timeout(wil->wmi_handled_wq,
 				wmi_reply_seq_done(wil, seq), remain)) {
-		wil_err(wil, "wmi_call(0x%04x->0x%04x) handler timeout %d msec\n",
-			cmdid, reply_id, to_msec);
+		wil_err(wil, "wmi_call(%s 0x%04x -> %s 0x%04x) mid %d handler timeout %d msec\n",
+			cmdid2name(cmdid), cmdid, eventid2name(reply_id),
+			reply_id, mid, to_msec);
 		rc = -ETIME;
 	}
 
@@ -2827,8 +2836,11 @@ int wmi_pcp_start(struct wil6210_vif *vif, int bi, u8 wmi_nettype,
 	if (rc)
 		return rc;
 
-	if (reply.evt.status != WMI_FW_STATUS_SUCCESS)
+	if (reply.evt.status != WMI_FW_STATUS_SUCCESS) {
+		wil_err(wil, "PCP_START mid %d nettype %d channel %d: FW status %d\n",
+			vif->mid, wmi_nettype, chan, reply.evt.status);
 		rc = -EINVAL;
+	}
 
 	if (wmi_nettype != WMI_NETTYPE_P2P)
 		/* Don't fail due to error in the led configuration */

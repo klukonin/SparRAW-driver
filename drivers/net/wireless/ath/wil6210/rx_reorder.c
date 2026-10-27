@@ -153,16 +153,16 @@ __acquires(&sta->tid_rx_lock) __releases(&sta->tid_rx_lock)
 		r->first_time = false;
 		if (seq != r->head_seq_num) {
 			if (seq_less(seq, r->head_seq_num)) {
-				wil_err(wil,
-					"Error: frame with early sequence 0x%03x, should be 0x%03x. Waiting...\n",
-					seq, r->head_seq_num);
+				wil_err_ratelimited(wil,
+						    "CID %d TID %d: frame with early sequence 0x%03x, should be 0x%03x. Waiting...\n",
+						    cid, tid, seq, r->head_seq_num);
 				r->first_time = true;
 				wil_netif_rx_any(skb, ndev);
 				goto out;
 			}
-			wil_err(wil,
-				"Error: 1-st frame with wrong sequence 0x%03x, should be 0x%03x. Fixing...\n",
-				seq, r->head_seq_num);
+			wil_err_ratelimited(wil,
+					    "CID %d TID %d: 1-st frame with wrong sequence 0x%03x, should be 0x%03x. Fixing...\n",
+					    cid, tid, seq, r->head_seq_num);
 			r->head_seq_num = seq;
 			r->ssn = seq;
 		}
@@ -233,12 +233,13 @@ void wil_rx_bar(struct wil6210_priv *wil, struct wil6210_vif *vif,
 
 	r = sta->tid_rx[tid];
 	if (!r) {
-		wil_err(wil, "BAR for non-existing CID %d TID %d\n", cid, tid);
+		wil_err_ratelimited(wil, "BAR for non-existing CID %d TID %d\n",
+				    cid, tid);
 		goto out;
 	}
 	if (seq_less(seq, r->head_seq_num)) {
-		wil_err(wil, "BAR Seq 0x%03x preceding head 0x%03x\n",
-			seq, r->head_seq_num);
+		wil_err_ratelimited(wil, "BAR CID %d TID %d Seq 0x%03x preceding head 0x%03x\n",
+				    cid, tid, seq, r->head_seq_num);
 		goto out;
 	}
 	wil_dbg_txrx(wil, "BAR: CID %d MID %d TID %d Seq 0x%03x head 0x%03x\n",

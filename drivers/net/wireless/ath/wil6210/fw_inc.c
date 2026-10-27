@@ -698,11 +698,16 @@ static int wil_brd_process(struct wil6210_priv *wil, const void *data,
 	 * and one or several data records.
 	 * Each record starts with wil_fw_record_head.
 	 */
-	if (size < sizeof(*hdr))
+	if (size < sizeof(*hdr)) {
+		wil_err_fw(wil, "brd: file too short: %zu bytes\n", size);
 		return -EINVAL;
+	}
 	s = sizeof(*hdr) + le32_to_cpu(hdr->size);
-	if (s > size)
+	if (s > size) {
+		wil_err_fw(wil, "brd: header record size %u > file %zu\n",
+			   le32_to_cpu(hdr->size), size);
 		return -EINVAL;
+	}
 
 	/* Skip the header record and handle the data records */
 	size -= s;
@@ -721,10 +726,18 @@ static int wil_brd_process(struct wil6210_priv *wil, const void *data,
 		hdr_sz = le32_to_cpu(hdr->size);
 		s = sizeof(*hdr) + hdr_sz;
 		if (wil->brd_info[i].file_max_size &&
-		    hdr_sz > wil->brd_info[i].file_max_size)
+		    hdr_sz > wil->brd_info[i].file_max_size) {
+			wil_err_fw(wil,
+				   "brd record %d addr 0x%08x: size %zu > max %u\n",
+				   i, wil->brd_info[i].file_addr, hdr_sz,
+				   wil->brd_info[i].file_max_size);
 			return -EINVAL;
-		if (sizeof(*hdr) + hdr_sz > size)
+		}
+		if (sizeof(*hdr) + hdr_sz > size) {
+			wil_err_fw(wil, "brd record %d: size %zu > left %zu\n",
+				   i, hdr_sz, size - sizeof(*hdr));
 			return -EINVAL;
+		}
 		if (hdr_sz % 4) {
 			wil_err_fw(wil, "unaligned record size: %zu\n",
 				   hdr_sz);
